@@ -1,0 +1,36 @@
+# Paths for the Synthetic Evidence Corpus pipeline. Everything is rooted at
+# `project_root`; derived paths are resolved relative to it by `sec.config`.
+
+project_root: /mnt/data/jaleh/CIFAR/SyntheticEvidenceCorpus
+
+corpus_dir: corpus
+manifest_path: manifest/manifest.parquet
+logs_dir: logs
+prompts_log_dir: prompts_log
+qa_dir: qa
+audit_dir: audit
+style_pools_dir: style_pools
+assets_dir: assets
+
+sources:
+  sroie:
+    root: /mnt/data/jaleh/CIFAR/Datasets/SROIE2019
+    task1_train_dir: "0325updated.task1train(626p)"
+    task2_train_dir: "0325updated.task2train(626p)"
+    test_image_dir: "task1&2_test(361p)"
+    test_text_dir: "text.task1&2-test（361p)"
+  cord:
+    # HuggingFace dataset naver-clova-ix/cord-v2. `root` is a local cache dir
+    # under which images are materialised as PNGs for the pipeline; `hf_cache`
+    # points the HF datasets library at a persistent download location.
+    root: /mnt/data/jaleh/CIFAR/Datasets/CORD-v2-cache
+    hf_cache: /mnt/data/jaleh/CIFAR/Datasets/CORD-v2-cache/hf
+    hf_name: naver-clova-ix/cord-v2
+  findit:
+    # FindIt2 (SROIE-style receipts: train/val/test with png + plain transcript).
+    # Pre-forged rows (forged=1 in split CSV) are excluded by the loader.
+    root: /mnt/data/jaleh/CIFAR/Datasets/findit2
+
+pool_split:
+  # Disjoint by document ID: hash(doc_id) % 100 < 75 -> train else test.
+  train_bucket_max_exclusive: 75

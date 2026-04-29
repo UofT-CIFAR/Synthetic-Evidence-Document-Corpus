@@ -1,0 +1,60 @@
+{
+  "_comment": "Flux.1-Fill inpaint workflow template. ComfyUIAdapter substitutes <<PROMPT>>, <<SEED>>, <<INPUT_IMAGE>>, <<INPUT_MASK>> at queue time. Node layout follows the standard ComfyUI Flux Fill example; edit node IDs as needed to match the local ComfyUI installation.",
+  "10": {
+    "class_type": "LoadImage",
+    "inputs": {"image": "<<INPUT_IMAGE>>"}
+  },
+  "11": {
+    "class_type": "LoadImage",
+    "inputs": {"image": "<<INPUT_MASK>>"}
+  },
+  "12": {
+    "class_type": "ImageToMask",
+    "inputs": {"image": ["11", 0], "channel": "red"}
+  },
+  "20": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {"ckpt_name": "flux1-fill-dev.safetensors"}
+  },
+  "30": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {"text": "<<PROMPT>>", "clip": ["20", 1]}
+  },
+  "31": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {"text": "", "clip": ["20", 1]}
+  },
+  "40": {
+    "class_type": "InpaintModelConditioning",
+    "inputs": {
+      "positive": ["30", 0],
+      "negative": ["31", 0],
+      "pixels": ["10", 0],
+      "vae": ["20", 2],
+      "mask": ["12", 0]
+    }
+  },
+  "50": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["20", 0],
+      "seed": "<<SEED>>",
+      "steps": 28,
+      "cfg": 3.5,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "positive": ["40", 0],
+      "negative": ["40", 1],
+      "latent_image": ["40", 2]
+    }
+  },
+  "60": {
+    "class_type": "VAEDecode",
+    "inputs": {"samples": ["50", 0], "vae": ["20", 2]}
+  },
+  "99": {
+    "class_type": "SaveImage",
+    "inputs": {"filename_prefix": "sec_flux_fill", "images": ["60", 0]}
+  }
+}

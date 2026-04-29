@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Pipeline outputs (regenerate locally or ship via object storage / release artifact)
+corpus/
+manifest/*.parquet
+logs/
+prompts_log/
+qa/
+audit/
+
+# Optional: keep small samples by force-adding with git add -f
+# corpus/.gitkeep
+
+# Style pool reference images (often large); version separately if needed
+# style_pools/
+
+# Local dataset roots (paths.yaml points outside repo on each machine)
+# Do not commit SROIE/CORD/FindIt downloads.
+
+# Jupyter / tooling
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+
+# Secrets (never commit)
+*.pem
+secrets.yaml
+configs/local*.yaml

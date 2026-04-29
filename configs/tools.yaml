@@ -1,0 +1,68 @@
+# Tool configuration for the four variants. Credentials are read from the
+# environment variables named below. Model identifiers are pinned here so
+# manifest entries can record the exact `tool_specific` version used.
+
+variants:
+  A:
+    tool_family: closed_llm
+    tool_specific: openai:gpt-image-2+gpt-4o-2024-11-20
+    adapter: sec.adapters.gpt:GPTAdapter
+    env:
+      api_key: OPENAI_API_KEY
+    models:
+      image: gpt-image-2
+      vision: gpt-4o
+      text: gpt-4o
+    endpoint: https://api.openai.com/v1
+  B:
+    tool_family: closed_llm
+    tool_specific: google:gemini-2.5-flash-image+gemini-2.5-pro
+    adapter: sec.adapters.gemini:GeminiAdapter
+    env:
+      api_key: GOOGLE_API_KEY
+    models:
+      image: gemini-2.5-flash-image
+      text: gemini-2.5-pro
+    endpoint: https://generativelanguage.googleapis.com/v1beta
+  C:
+    tool_family: closed_llm
+    tool_specific: ideogram:v3
+    adapter: sec.adapters.ideogram:IdeogramAdapter
+    env:
+      api_key: IDEOGRAM_API_KEY
+    models:
+      image: ideogram-v3
+    endpoint: https://api.ideogram.ai
+    # Ideogram has no text-only model; T3/T4 text drafting falls through to
+    # whichever text-capable adapter is configured as `text_fallback`.
+    text_fallback: A
+  D:
+    tool_family: open_llm
+    tool_specific: comfyui:flux1-fill+sd3-medium
+    adapter: sec.adapters.comfyui:ComfyUIAdapter
+    env:
+      url: COMFYUI_URL
+    workflows:
+      # Resolved relative to configs/comfyui/
+      inpaint: flux_fill_inpaint.json
+      generate: sd3_medium_generate.json
+    # D uses the text_fallback for Tier-3 language drafting
+    text_fallback: A
+
+provenance:
+  exif_comment: "synthetic-evidence-corpus:true"
+  xmp_namespace: "https://synthetic-evidence-corpus.example/ns/1.0"
+  xmp_key: synthetic
+  stego:
+    # 64-bit LSB marker embedded at (stego_x0:stego_x0+64, stego_y0) in the first channel.
+    magic_hex: "5345432d53594e5448"  # 'SEC-SYNTH'
+    x0: 0
+    y0: 0
+
+ocr:
+  tesseract_cmd: tesseract
+  min_confidence: 0.85
+
+seeds:
+  base_train: 11000
+  base_test: 81000
