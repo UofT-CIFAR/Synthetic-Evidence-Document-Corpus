@@ -22,7 +22,7 @@ re-saved through a tool path per spec §4.6).
 ## Setup
 
 ```bash
-cd /mnt/data/jaleh/CIFAR/SyntheticEvidenceCorpus
+cd CIFAR/SyntheticEvidenceCorpus
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
