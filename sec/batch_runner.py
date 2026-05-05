@@ -383,16 +383,16 @@ class BatchRunner:
                 ),
             }
             return res.image, patch, res.prompt, ""
-            res = t2_hw.apply(
-                source,
-                adapter=self.adapter,
-                pools=self.style_pools,
-                pool=self.batch.pool,
-                item_index=item_index,
-                batch_seed_value=self.batch.seed,
-                assets_dir=ASSETS_DIR,
-                image_edit_scope=self._image_edit_scope,
-            )
+        res = t2_hw.apply(
+            source,
+            adapter=self.adapter,
+            pools=self.style_pools,
+            pool=self.batch.pool,
+            item_index=item_index,
+            batch_seed_value=self.batch.seed,
+            assets_dir=ASSETS_DIR,
+            image_edit_scope=self._image_edit_scope,
+        )
         patch = {
             "_source": source,
             "identity_seed": res.identity_seed,
