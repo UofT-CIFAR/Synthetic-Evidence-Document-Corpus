@@ -1,12 +1,12 @@
 """X-T1-DATE-IMG: change the date on a SROIE receipt (spec §6 Tier 1).
 
-The **inpainter** receives a short *paper-erase* prompt only: remove ink in
-the mask and fill with seamless blank receipt paper — no new digits (that
-avoids double-printing when we ``burn_text_matched`` the new date).
+**Default (API):** one ``apply_full_image_inpaint`` call—full frame to the adapter with
+a clone prompt. There is **no** local pixel fallback on API failure; errors propagate.
 
-The full procedural spec text is still built for manifest / audit as
-``build_spec_prompt`` and stored in ``DateEditResult.prompt`` alongside the
-API erase prompt.
+**Optional dev-only:** set ``tier1_date.use_local_burn_only: true`` in ``tools.yaml`` for
+``burn_text_matched`` without any API call.
+
+The audit spec text is still ``build_spec_prompt`` in ``DateEditResult.prompt``.
 """
 
 from __future__ import annotations
@@ -18,31 +18,52 @@ from PIL import Image
 from ..adapters.base import AdapterCapabilityError, AdapterCredentialError, VariantAdapter
 from ..ocr.tesseract import detect_font
 from ..sources.sroie import SROIEItem
-from .common import (
-    apply_inpaint_local,
-    build_mask,
-    date_offset_for,
-    shift_date,
-)
-from .font_match import burn_text_matched, recolor_patch_to_paper
+from .common import apply_full_image_inpaint, date_offset_for, shift_date
+from .font_match import burn_text_matched
 
 
-# Sent to ``adapter.inpaint`` only. Must not ask for the new date string —
-# local ``burn_text_matched`` renders all glyphs after a clean paper fill.
-_INPAINT_PROMPT_ERASE = (
-    "Edit ONLY inside the white painted mask. Completely remove all printed text, "
-    "digits, slashes, hyphens, and ink in that region. Fill it with seamless "
-    "blank thermal receipt paper matching the brightness, grain, and tint of "
-    "the neighboring paper. Do NOT draw any replacement characters, numbers, "
-    "dates, punctuation, logos, shading, gradients, outlines, shadows, stickers, "
-    "or tinted rectangles. Output must contain zero readable characters in "
-    "the masked area — plain empty paper only."
-)
+def _inpaint_prompt_patch_date(new_date: str, offset_days: int) -> str:
+    """Reference prompt recorded when ``use_local_burn_only`` (no patch API in default path)."""
+
+    if offset_days == 0:
+        shift = f'The date text must read exactly "{new_date}".'
+    else:
+        direction = "forward" if offset_days > 0 else "backward"
+        shift = (
+            f"Change the date on this receipt {direction} by {abs(offset_days)} days "
+            f'so it reads exactly "{new_date}".'
+        )
+    return (
+        "Keep the image exactly the same. Change ONLY the date. "
+        f"{shift} "
+        "Match the font and background. Do not delete the date completely."
+    )
 
 
-# Verbatim from the Synthetic Evidence Corpus spec, §6 Tier 1, X-T1-DATE-IMG.
-# `{old_date}`, `{new_date}`, `{offset_days}`, `{bbox}`, and `{font_hint}` are
-# substituted per item; the rest of the text is the spec procedure as-is.
+def _inpaint_prompt_full_image_clone(
+    old_date: str, new_date: str, offset_days: int
+) -> str:
+    """Full-frame API prompt: same image; only the date string changes."""
+
+    shift_note = ""
+    if offset_days != 0:
+        direction = "forward" if offset_days > 0 else "backward"
+        shift_note = (
+            f" The calendar shift is {direction} by {abs(offset_days)} days; "
+            f'the printed date must read "{new_date}" instead of "{old_date}".'
+        )
+    return (
+        "Recreate this exact receipt image from the input: the output must be visually "
+        "the same photograph—same angle, lighting, resolution, paper color, grain, noise, "
+        "and every line of text and numbers **unchanged** except the date field. "
+        f'Replace only the date "{old_date}" with "{new_date}", matching the font, size, '
+        f"and print style of nearby characters on the receipt.{shift_note} "
+        "Do not crop, reframe, or resize. Do not add borders, boxes, shadows, watermarks, "
+        "or captions. Output one RGB image with **exactly** the same width and height "
+        "as the input (same pixel dimensions)."
+    )
+
+
 _SPEC_PROMPT = (
     "X-T1-DATE-IMG — Change a date on a scanned/image document by inpainting.\n"
     "\n"
@@ -52,28 +73,17 @@ _SPEC_PROMPT = (
     "2. Pick a date offset by sampling uniformly from {{±7 days, ±30 days, "
     "±90 days, ±365 days, ±730 days}} using the batch seed. Four items per "
     "offset range. (Pre-sampled: {offset_days} days, new date = \"{new_date}\".)\n"
-    "3. Inpaint a rectangle 10% larger than the date's bounding box. Prompt "
-    "the inpainter with \"printed receipt date in matching font, no shadow, "
-    "no blur.\"\n"
-    "4. Burn in the new date string \"{new_date}\" in a font that matches the "
-    "surrounding text. Use Tesseract's font detection to pick the match "
-    "(detected: {font_hint}).\n"
-    "5. Save as PNG at the same dimensions as the source. Preserve every "
-    "other pixel of the receipt (paper texture, all other text, stamps, "
-    "borders) exactly as in the input.\n"
-    "6. Return only the edited receipt image."
+    "3. Full-frame adapter inpaint: reproduce the receipt; change only the date.\n"
+    "4. Use Tesseract font hint for audit: {font_hint}.\n"
+    "5. Save as PNG at the same dimensions as the source.\n"
+    "6. API-only path: no local burn fallback.\n"
 )
 
 
 def _date_subbbox(
     line_bbox: tuple[int, int, int, int], line_text: str, date_text: str
 ) -> tuple[int, int, int, int]:
-    """Tighten ``line_bbox`` to just the substring ``date_text``.
-
-    SROIE/CORD OCR boxes are line-level, so a date that shares a line with
-    a time stamp or label inherits a too-wide bbox. We approximate the
-    date's pixel footprint by character-position ratio inside the line.
-    """
+    """Tighten ``line_bbox`` to just the substring ``date_text``."""
 
     x, y, w, h = line_bbox
     if not line_text or not date_text:
@@ -122,7 +132,7 @@ def apply(
     adapter: VariantAdapter,
     item_index: int,
     seed: int,
-    forbid_adapter_fallback: bool = False,
+    use_local_burn_only: bool = False,
 ) -> DateEditResult:
     if not item.has_task2():
         raise ValueError(f"Item {item.doc_id} has no task2 KV; cannot locate date field")
@@ -132,26 +142,16 @@ def apply(
     offset = date_offset_for(item_index)
     new_date = shift_date(old_date, offset)
     if new_date is None:
-        new_date = old_date  # unparseable date, fall through with no shift
+        new_date = old_date
         offset = 0
     line = item.find_line_for_text(old_date)
     if line is None:
         raise ValueError(f"Item {item.doc_id}: date {old_date!r} not found in task1 OCR lines")
     line_bbox = line.bbox()
-    # SROIE task1 ships OCR lines like ``24 MAY 2018 18:29`` whose bbox is
-    # wider than the date alone. Tighten to the date substring so the
-    # matched-burn step renders a string that occupies *exactly* the date's
-    # on-paper footprint (not the line's), avoiding the
-    # "characters look stretched / mono-spaced" failure mode.
     bbox = _date_subbbox(line_bbox, line.text, old_date)
 
     image = Image.open(item.image_path).convert("RGB")
     font_hint = detect_font(item.image_path, bbox)
-    # The Tesseract LSTM does not return a true font name; treat the hint as a
-    # weak tiebreaker only. Width-matching across the whole receipt-font pool
-    # is a stronger signal than the hint, so we leave the pool unbiased and
-    # let the matcher pick the natural fit for the date's bbox dimensions.
-    mono_hint = False
     manifest_prompt = build_spec_prompt(
         bbox=bbox,
         old_date=old_date,
@@ -159,52 +159,53 @@ def apply(
         offset_days=offset,
         font_hint=font_hint,
     )
+
+    if use_local_burn_only:
+        result_image = burn_text_matched(
+            image,
+            new_date,
+            bbox,
+            color_reference=image,
+            mono_hint=True,
+            seed=seed,
+            fill_paper_first=True,
+        )
+        ref_patch = _inpaint_prompt_patch_date(new_date, offset)
+        full_p = _inpaint_prompt_full_image_clone(old_date, new_date, offset)
+        prompt = (
+            "### Date edit: local burn only (tier1_date.use_local_burn_only=true)\n"
+            f"(Reference patch prompt: {ref_patch!r})\n"
+            f"(Reference full-frame prompt: {full_p!r})\n\n"
+            "### Spec procedure (audit / manifest)\n"
+            f"{manifest_prompt}"
+        )
+        return DateEditResult(
+            image=result_image,
+            bbox=bbox,
+            old_date=old_date,
+            new_date=new_date,
+            offset_days=offset,
+            prompt=prompt,
+            notes=f"edit_path=local_burn; font_hint={font_hint!r}",
+        )
+
+    api_inpaint_prompt = _inpaint_prompt_full_image_clone(old_date, new_date, offset)
     prompt = (
-        "### API inpaint (paper erase only)\n"
-        f"{_INPAINT_PROMPT_ERASE}\n\n"
+        "### API inpaint — full frame only (identical receipt, new date)\n"
+        f"{api_inpaint_prompt}\n\n"
         "### Spec procedure (audit / manifest)\n"
         f"{manifest_prompt}"
     )
-    # Spec §6 step 3: 10%-padded rectangle.
-    mask = build_mask(image.size, bbox, expand=0.1)
-    notes = ""
-    inpaint_succeeded = False
     try:
-        inpainted = apply_inpaint_local(
+        result_image = apply_full_image_inpaint(
             image,
-            mask,
             adapter=adapter,
-            prompt=_INPAINT_PROMPT_ERASE,
+            prompt=api_inpaint_prompt,
             seed=seed,
-        )
-        inpaint_succeeded = True
-    except (AdapterCapabilityError, AdapterCredentialError) as e:
-        if forbid_adapter_fallback:
-            raise
-        # Adapter unavailable — fall back to drawing on the original.
-        inpainted = image
-        notes = f"adapter_fallback: {e}"
+        ).convert("RGB")
+    except (AdapterCapabilityError, AdapterCredentialError):
+        raise
 
-    if inpaint_succeeded:
-        # gpt-image-2 frequently returns a yellow/mustard cast on the
-        # inpainted region. Pull its mean RGB to the surrounding paper
-        # color (preserving the model's local texture) so the patch reads
-        # as receipt paper, not a colored sticker.
-        inpainted = recolor_patch_to_paper(
-            inpainted, bbox, color_reference=image
-        )
-
-    # Spec §6 step 4: ALWAYS burn the new date string locally. Feathered paper
-    # fill hides blurry ghost digits left by the inpainter beneath crisp glyphs.
-    result_image = burn_text_matched(
-        inpainted,
-        new_date,
-        bbox,
-        color_reference=image,  # always sample ink/paper from the unmodified scan
-        mono_hint=mono_hint,
-        seed=seed,
-        fill_paper_first=True,
-    )
     return DateEditResult(
         image=result_image,
         bbox=bbox,
@@ -212,5 +213,5 @@ def apply(
         new_date=new_date,
         offset_days=offset,
         prompt=prompt,
-        notes=notes or f"font_hint={font_hint!r} mono_hint={mono_hint}",
+        notes=f"edit_path=api_full_image; font_hint={font_hint!r}",
     )

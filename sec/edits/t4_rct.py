@@ -1,21 +1,26 @@
-"""X-T4-RCT: fabricate an entire receipt from nothing (spec §6 Tier 4)."""
+"""X-T4-RCT: fabricate an entire receipt from nothing (spec §6 Tier 4).
+
+Anchor SROIE receipt **images** condition ``adapter.few_shot_image``; the
+returned raster is the corpus artifact. There is no local Pillow
+``render_receipt`` or JSON drafting path for the final pixels.
+"""
 
 from __future__ import annotations
 
-import json
 import random
-import re
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from PIL import Image
 
-from ..adapters.base import AdapterCapabilityError, AdapterCredentialError, VariantAdapter
+from ..adapters.base import VariantAdapter
 from ..identity import generate_identity, generate_merchant
-from ..renderer import ReceiptDoc, render_receipt
+from ..renderer import ReceiptDoc
 from ..sources.sroie import SROIELoader, SROIEItem
+
+
+# Portrait thermal-ticket shape; adapters map to supported API sizes where needed.
+T4_IMAGE_SIZE: tuple[int, int] = (620, 1200)
 
 
 @dataclass
@@ -27,7 +32,7 @@ class T4Result:
     prompt: str
     response_raw: str
     anchor_ids: tuple[str, ...]
-    doc: ReceiptDoc
+    doc: ReceiptDoc | None = None
     notes: str = ""
 
 
@@ -58,61 +63,14 @@ def _render_prompt(template: str, substitutions: dict[str, str]) -> str:
     return out
 
 
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _parse_receipt_json(response: str) -> dict[str, Any] | None:
-    response = response.strip()
-    match = _JSON_BLOCK_RE.search(response)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-
-
-def _local_receipt(
-    customer: dict[str, Any],
-    merchant: dict[str, Any],
-    seed: int,
-    sub_variant: str,
-) -> dict[str, Any]:
-    rng = random.Random(seed)
-    n = rng.randint(3, 7)
-    line_items = []
-    subtotal = 0.0
-    for i in range(n):
-        amt = round(rng.uniform(0.99, 35.00), 2)
-        label = rng.choice(
-            [
-                "COFFEE",
-                "SANDWICH",
-                "JUICE",
-                "SNACK",
-                "BAKERY",
-                "BEVERAGE",
-                "COMBO",
-                "MISC",
-            ]
-        )
-        line_items.append({"label": label, "amount": amt})
-        subtotal += amt
-    subtotal = round(subtotal, 2)
-    tax = round(subtotal * 0.06, 2)
-    if sub_variant == "inconsistent":
-        tax = round(tax * rng.choice([0.5, 1.6, 2.2]), 2)
-    total = round(subtotal + tax, 2)
-    return {
-        "merchant": merchant["merchant_name"],
-        "merchant_address": merchant["merchant_address"],
-        "date": (datetime.now() - timedelta(days=rng.randint(0, 365))).strftime("%d/%m/%Y"),
-        "line_items": line_items,
-        "subtotal": subtotal,
-        "tax": tax,
-        "total": total,
-        "payment_method": rng.choice(["CASH", "VISA ****1234", "MASTERCARD ****9988"]),
-    }
+def _load_anchor_images(anchors: list[SROIEItem]) -> list[Image.Image]:
+    refs: list[Image.Image] = []
+    for anc in anchors:
+        try:
+            refs.append(Image.open(anc.image_path).convert("RGB"))
+        except OSError:
+            continue
+    return refs
 
 
 def apply(
@@ -122,7 +80,6 @@ def apply(
     item_index: int,
     batch_seed_value: int,
     prompts_dir: Path,
-    forbid_adapter_fallback: bool = False,
 ) -> T4Result:
     item_seed = batch_seed_value * 1000 + item_index
     identity = generate_identity(item_seed)
@@ -131,9 +88,19 @@ def apply(
 
     anchor_seed = item_seed ^ 0xA4A4A4
     anchors = _pick_anchors(loader, anchor_seed)
-    template_path = prompts_dir / "T4-RCT.md"
-    template = template_path.read_text(encoding="utf-8") if template_path.exists() else (
-        "Fabricate a receipt. Customer {customer_name} {customer_address}. Merchant {merchant_name} {merchant_address}. Anchors: {anchor_block}. sub_variant: {sub_variant}. Output JSON."
+    ref_images = _load_anchor_images(anchors)
+
+    template_path = prompts_dir / "T4-RCT-image.md"
+    template = (
+        template_path.read_text(encoding="utf-8")
+        if template_path.exists()
+        else (
+            "Generate one photorealistic thermal receipt image. Customer {customer_name} "
+            "{customer_address}. Merchant {merchant_name} {merchant_address} "
+            "phone {merchant_phone}. Style like references. Anchor OCR tone: {anchor_block}. "
+            "sub_variant {sub_variant}: if inconsistent, tax wrong by >=5% but total=subtotal+tax. "
+            "Narrow portrait, no JSON."
+        )
     )
     prompt = _render_prompt(
         template,
@@ -148,40 +115,14 @@ def apply(
         },
     )
 
-    response_raw = ""
-    notes = ""
-    try:
-        response_raw = adapter.text_complete(prompt=prompt, seed=item_seed, max_tokens=700)
-    except (AdapterCapabilityError, AdapterCredentialError) as e:
-        if forbid_adapter_fallback:
-            raise
-        notes = f"adapter_fallback: {e}"
-
-    parsed = _parse_receipt_json(response_raw) if response_raw else None
-    if parsed is None:
-        if forbid_adapter_fallback:
-            raise AdapterCapabilityError(
-                "Variant B requires adapter text_complete JSON for Tier-4; "
-                "local synthetic receipt fallback disabled when forbid_adapter_fallback is True."
-            )
-        parsed = _local_receipt(identity.as_dict(), merchant, item_seed, sub_variant)
-
-    line_items = [
-        (str(li.get("label", "ITEM")), float(li.get("amount", 0.0)))
-        for li in parsed.get("line_items", [])
-    ]
-    doc = ReceiptDoc(
-        merchant=str(parsed.get("merchant", merchant["merchant_name"])),
-        merchant_address=str(parsed.get("merchant_address", merchant["merchant_address"])),
-        date=str(parsed.get("date", datetime.now().strftime("%d/%m/%Y"))),
-        line_items=line_items,
-        subtotal=float(parsed.get("subtotal", sum(a for _, a in line_items))),
-        tax=float(parsed.get("tax", 0.0)),
-        total=float(parsed.get("total", sum(a for _, a in line_items))),
-        payment_method=str(parsed.get("payment_method", "CASH")),
-        customer_name=identity.name,
+    image = adapter.few_shot_image(
+        ref_images,
+        prompt,
+        item_seed,
+        size=T4_IMAGE_SIZE,
     )
-    image = render_receipt(doc, seed=item_seed)
+    w, h = image.size
+    response_raw = f"few_shot_image {w}x{h}"
     return T4Result(
         image=image,
         sub_variant=sub_variant,
@@ -190,6 +131,6 @@ def apply(
         prompt=prompt,
         response_raw=response_raw,
         anchor_ids=tuple(a.doc_id for a in anchors),
-        doc=doc,
-        notes=notes,
+        doc=None,
+        notes="",
     )

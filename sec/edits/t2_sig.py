@@ -1,9 +1,11 @@
 """X-T2-SIG: forged signature on a SROIE receipt (spec §6 Tier 2).
 
-Loads reference signatures from the style pool, asks the adapter for a new
-signature in that style, applies per-item perturbation (rotation ±2°, scale
-±5%, shear ±2°, HSV ink jitter, pressure noise), and composites onto a
-plausible signature area of the receipt.
+Loads reference signatures from the style pool, asks ``few_shot_image`` for a
+new raster signature (API image output), perturbs it, and composites onto the
+receipt — already image-in / glyph-image-out from the adapter.
+
+Full-frame ``image_edit_scope`` uses ``apply_full_image_inpaint`` only; there
+is no fallback to the patch path when it fails.
 """
 
 from __future__ import annotations
@@ -11,15 +13,15 @@ from __future__ import annotations
 import colorsys
 import math
 import random
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 from PIL import Image
 
-from ..adapters.base import AdapterCapabilityError, AdapterCredentialError, VariantAdapter
+from ..adapters.base import VariantAdapter
 from ..identity import generate_identity
 from ..sources.sroie import SROIEItem
-from ..style_pools import REFS_PER_STYLE, StylePools, _fallback_stroke
+from ..style_pools import REFS_PER_STYLE, StylePools
+from .common import apply_full_image_inpaint
 
 
 @dataclass
@@ -40,10 +42,6 @@ class SigResult:
     prompt: str
     perturbation: PerturbParams
     notes: str = ""
-
-
-def _pool_name(pool: str) -> str:
-    return "train" if pool.upper() == "TRN" else "test"
 
 
 def _load_refs(pools: StylePools, pool: str, style_index: int) -> list[Image.Image]:
@@ -113,6 +111,18 @@ def _default_sig_region(image: Image.Image) -> tuple[int, int, int, int]:
     return x, y, box_w, box_h
 
 
+def _inpaint_prompt_full_image_sig(name: str, bbox: tuple[int, int, int, int]) -> str:
+    x, y, w, h = bbox
+    return (
+        "Recreate this receipt photo so it matches the input except add one realistic "
+        f'handwritten signature for "{name}" in blue or black ballpoint ink, placed in '
+        "the lower-right signing area "
+        f"(target region roughly x={x}, y={y}, w={w}, h={h}). "
+        "Do not change printed text, logos, or totals. No borders or watermarks. "
+        "Same image dimensions as the input."
+    )
+
+
 def apply(
     item: SROIEItem,
     *,
@@ -121,31 +131,54 @@ def apply(
     pool: str,
     item_index: int,
     batch_seed_value: int,
-    forbid_adapter_fallback: bool = False,
+    image_edit_scope: str = "full_image",
 ) -> SigResult:
     item_seed = batch_seed_value * 1000 + item_index
-    pool_name = _pool_name(pool)
     pool_size = pools.pool_size(pool)
     style_index = item_seed % pool_size
     refs = _load_refs(pools, pool, style_index)
     identity = generate_identity(item_seed)
     name = identity.name
-    prompt = f"signature of {name}, black or blue ink, no background"
+    glyph_prompt = f"signature of {name}, black or blue ink, no background"
 
-    sig_img: Image.Image | None = None
-    notes = ""
-    try:
-        sig_img = adapter.few_shot_image(refs=refs, prompt=prompt, seed=item_seed, size=(420, 120))
-    except (AdapterCapabilityError, AdapterCredentialError) as e:
-        if forbid_adapter_fallback:
-            raise
-        notes = f"adapter_fallback: {e}"
-    if sig_img is None:
-        sig_img = _fallback_stroke(name, item_seed)
+    scope = (image_edit_scope or "full_image").strip().lower()
+    if scope not in ("full_image", "patch"):
+        scope = "full_image"
+
+    base_rgba = Image.open(item.image_path).convert("RGBA")
+    bbox = _default_sig_region(base_rgba)
+
+    if scope == "full_image":
+        full_prompt = _inpaint_prompt_full_image_sig(name, bbox)
+        out_rgb = apply_full_image_inpaint(
+            base_rgba.convert("RGB"),
+            adapter=adapter,
+            prompt=full_prompt,
+            seed=item_seed,
+        )
+        return SigResult(
+            image=out_rgb,
+            bbox=bbox,
+            style_pool_index=style_index,
+            identity_seed=identity.item_seed,
+            signature_name=name,
+            prompt=full_prompt
+            + f"\n\n(Glyph few-shot prompt if patch path: {glyph_prompt!r})",
+            perturbation=PerturbParams(
+                rotation_deg=0.0,
+                scale=1.0,
+                shear_deg=0.0,
+                ink_hsv=(0.0, 0.0, 0.0),
+            ),
+            notes="edit_path=t2_sig_full_image",
+        )
+
+    sig_img = adapter.few_shot_image(
+        refs=refs, prompt=glyph_prompt, seed=item_seed, size=(420, 120)
+    )
     sig_img, perturb = _perturb(sig_img, item_seed)
 
     base = Image.open(item.image_path).convert("RGBA")
-    bbox = _default_sig_region(base)
     x, y, w, h = bbox
     scale = min(w / sig_img.width, h / sig_img.height, 1.0)
     new_w = max(1, int(sig_img.width * scale))
@@ -160,7 +193,7 @@ def apply(
         style_pool_index=style_index,
         identity_seed=identity.item_seed,
         signature_name=name,
-        prompt=prompt,
+        prompt=glyph_prompt,
         perturbation=perturb,
-        notes=notes,
+        notes="edit_path=t2_sig_patch_composite",
     )

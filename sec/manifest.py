@@ -127,6 +127,33 @@ def remove_rows_for_batch(manifest_path: Path, batch_id_to_remove: str) -> tuple
     return n_before, n_after
 
 
+def remove_rows_not_under_clean_corpus(manifest_path: Path) -> tuple[int, int]:
+    """Drop rows that do not reference a clean control PNG path.
+
+    Keeps rows whose ``file_path`` contains ``__clean__`` (see ``clean_controls``),
+    and rows with ``tier == 99`` (reserved). Use after deleting non-clean PNGs
+    under ``corpus/``.
+    """
+
+    rows = read_rows(manifest_path)
+    n_before = len(rows)
+
+    def _keep(row: dict) -> bool:
+        if row.get("tier") == 99:
+            return True
+        fp = row.get("file_path")
+        if not fp:
+            return False
+        return "__clean__" in str(fp).replace("\\", "/")
+
+    out = [r for r in rows if _keep(r)]
+    n_after = len(out)
+    if n_after == n_before:
+        return n_before, n_after
+    rewrite_manifest(manifest_path, out)
+    return n_before, n_after
+
+
 def clear_manifest(manifest_path: Path) -> None:
     """Remove all rows from the manifest (atomic write of an empty table)."""
 

@@ -1,8 +1,8 @@
 """X-T3: insert a line item or service fee on a SROIE receipt (spec §6 Tier 3).
 
-Asks the adapter's text model to draft a plausible new line, then inpaints a
-new row just above the subtotal / total area and burns the line text in with
-the same font jitter used elsewhere.
+Draft a plausible receipt line via ``adapter.text_complete``, then ask the
+vision adapter for **image in → image out**: the inserted row rendered in the
+frame or masked strip. There is no local ``burn_text_matched`` fallback.
 """
 
 from __future__ import annotations
@@ -13,12 +13,42 @@ from pathlib import Path
 
 from PIL import Image
 
-from ..adapters.base import AdapterCapabilityError, AdapterCredentialError, VariantAdapter
-from ..ocr.tesseract import detect_font
-from ..sources.sroie import SROIEItem, Task1Line
-from .common import parse_amount
-from .font_match import burn_text_matched, recolor_patch_to_paper
+from ..adapters.base import AdapterCapabilityError, VariantAdapter
+from ..sources.sroie import SROIEItem
+from .common import apply_full_image_inpaint, parse_amount
 from .t1_dollar_img import _guess_amount_lines
+
+
+def _inpaint_prompt_api_insert_line(
+    bbox: tuple[int, int, int, int], inserted_text: str
+) -> str:
+    """Instructions for ``adapter.inpaint``: full-page receipt out with one inserted row."""
+
+    x, y, w, h = bbox
+    return (
+        "Input: this receipt image with a white painted mask over one horizontal strip "
+        f"(bbox x,y,w,h = {x},{y},{w},{h}). "
+        "Output: the **same pixel dimensions** as the input. Fill ONLY that masked strip "
+        "with one believable printed receipt line matching surrounding monospace alignment "
+        f'that reads exactly: "{inserted_text}". '
+        "Match thermal receipt texture and digit styling from neighbouring rows. "
+        "Leave every pixel outside the mask unchanged. "
+        "Do not paste screenshot borders, QR overlays, or watermark banners."
+    )
+
+
+def _inpaint_prompt_full_image_insert_line(
+    bbox: tuple[int, int, int, int], inserted_text: str
+) -> str:
+    x, y, w, h = bbox
+    return (
+        "Recreate this receipt image to match the input in every detail (layout, "
+        "texture, lighting, all existing print). Insert exactly ONE new printed "
+        f'receipt line that reads: "{inserted_text}". Place it in the horizontal '
+        f"band around y={y} (approx. bbox x,y,w,h = {x},{y},{w},{h}), aligned like "
+        "neighbouring monospace rows; shift lower totals minimally if needed. "
+        "Do not add borders or watermarks. Same width and height as the input."
+    )
 
 
 MAX_WORDS = 20
@@ -66,7 +96,7 @@ def apply(
     seed: int,
     assets_dir: Path,
     prompts_dir: Path,
-    forbid_adapter_fallback: bool = False,
+    image_edit_scope: str = "full_image",
 ) -> T3Result:
     target = _pick_target(assets_dir / "clause_targets.txt", seed + item_index)
     template_path = prompts_dir / "T3-RCT-LINEITEM.md"
@@ -76,81 +106,52 @@ def apply(
     ocr_text = "\n".join(line.text for line in item.task1_lines)
     prompt = template.replace("{target}", target).replace("{ocr_text}", ocr_text)
 
-    response_raw = ""
-    notes = ""
-    try:
-        response_raw = adapter.text_complete(prompt=prompt, seed=seed, max_tokens=64)
-    except (AdapterCapabilityError, AdapterCredentialError) as e:
-        if forbid_adapter_fallback:
-            raise
-        notes = f"adapter_fallback: {e}"
-    if not response_raw.strip():
-        if forbid_adapter_fallback:
-            raise AdapterCapabilityError(
-                "Variant B requires adapter text_complete for Tier-3 drafting; "
-                "local draft disabled when forbid_adapter_fallback is True."
-            )
-        response_raw = _local_draft(target, item, seed + item_index)
+    response_raw = adapter.text_complete(prompt=prompt, seed=seed, max_tokens=64)
+    if not (response_raw or "").strip():
+        raise AdapterCapabilityError(
+            "Tier-3 requires non-empty text from adapter.text_complete."
+        )
 
     inserted_text = _clip(response_raw)
     original = Image.open(item.image_path).convert("RGB")
     image = original.copy()
     bbox = _insertion_bbox(item, image)
-    # Spec §6 Tier 3 (RCT batch table: "Insert line item or service fee").
-    # Send the full procedural instruction to the multimodal LLM so it can
-    # add the new row in matching font without us double-burning over its
-    # output. Local burn is reserved for adapter failures.
-    prompt_inpaint = (
-        "X-T3-RCT — Insert a new receipt line just above the subtotal/total.\n"
-        "\n"
-        "1. The receipt below is unmodified except for a strip you must fill.\n"
-        "2. Insert exactly one new line at bbox (x, y, w, h) = "
-        f"{bbox} with the text:\n"
-        f"   \"{inserted_text}\"\n"
-        "3. Inpaint prompt: \"printed receipt line, monospace digits, "
-        "matching font.\" Match the surrounding label/amount columns and the "
-        "receipt paper texture.\n"
-        "4. Save as PNG at the same dimensions as the source. Do not modify "
-        "any pixel outside the inserted line."
-    )
-    inpaint_succeeded = False
-    try:
+    scope = (image_edit_scope or "full_image").strip().lower()
+    if scope not in ("full_image", "patch"):
+        scope = "full_image"
+    if scope == "full_image":
+        inpaint_prompt = _inpaint_prompt_full_image_insert_line(bbox, inserted_text)
+    else:
+        inpaint_prompt = _inpaint_prompt_api_insert_line(bbox, inserted_text)
+    if scope == "full_image":
+        image = apply_full_image_inpaint(
+            image,
+            adapter=adapter,
+            prompt=inpaint_prompt,
+            seed=seed,
+        )
+    else:
         image = adapter.inpaint(
             image=image,
             mask=_mask_rect(image.size, bbox),
-            prompt=prompt_inpaint,
+            prompt=inpaint_prompt,
             seed=seed,
         )
-        inpaint_succeeded = True
-    except (AdapterCapabilityError, AdapterCredentialError) as e:
-        if forbid_adapter_fallback:
-            raise
-        if not notes:
-            notes = f"adapter_fallback: {e}"
-    if inpaint_succeeded:
-        image = recolor_patch_to_paper(image, bbox, color_reference=original)
-    # Spec §6 step 4 (analogous): burn the inserted line in a font that
-    # matches the surrounding amount column. Sample ink/paper from the
-    # original scan, not from the model's possibly-warped output.
-    font_hint = detect_font(item.image_path, bbox)
-    mono_hint = bool(font_hint and "Mono" in font_hint)
-    image = burn_text_matched(
-        image,
-        inserted_text,
-        bbox,
-        color_reference=original,
-        mono_hint=mono_hint,
-        seed=seed,
-        fill_paper_first=not inpaint_succeeded,
+    scope_label = "full-frame clone + insert row" if scope == "full_image" else "masked strip insert"
+    recorded_prompt = (
+        "### Tier-3 text adapter (draft inserted line)\n"
+        f"{prompt}\n\n"
+        f"### Tier-3 vision ({scope_label})\n"
+        f"{inpaint_prompt}"
     )
     return T3Result(
         image=image,
         bbox=bbox,
         inserted_text=inserted_text,
         target=target,
-        prompt=prompt,
+        prompt=recorded_prompt,
         response_raw=response_raw,
-        notes=notes,
+        notes="",
     )
 
 
@@ -171,23 +172,3 @@ def _clip(text: str) -> str:
     if len(words) > MAX_WORDS:
         line = " ".join(words[:MAX_WORDS])
     return line[:60]
-
-
-def _local_draft(target: str, item: SROIEItem, seed: int) -> str:
-    """Deterministic fallback receipt line used when no text adapter runs."""
-
-    rng = random.Random(seed)
-    label_words = target.split()[:3]
-    label = " ".join(label_words).upper() if label_words else "SERVICE FEE"
-    amount = round(rng.uniform(1.5, 9.99), 2)
-    prefix = ""
-    for line in item.task1_lines:
-        amt = parse_amount(line.text)
-        if amt is not None:
-            stripped = line.text.strip()
-            for ch in stripped:
-                if ch.isdigit():
-                    break
-                prefix += ch
-            break
-    return f"{label:<20} {prefix}{amount:.2f}".strip()

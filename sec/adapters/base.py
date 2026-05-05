@@ -8,8 +8,16 @@ Every variant exposes three operations so tier code is variant-agnostic:
 - ``text_complete``: return a string (used for Tier-3 insertion drafting).
 
 Adapters that cannot fulfil a particular method raise
-``AdapterCapabilityError`` and the pipeline falls back to the configured
-``text_fallback`` variant or to a deterministic local implementation.
+``AdapterCapabilityError`` or ``AdapterCredentialError``.
+
+RCT tier pipelines (batch runner) do **not** synthesize corpus pixels locally
+when vision or text calls fail, except Tier-1 date with explicit
+``tier1_date.use_local_burn_only: true``. Some adapters may delegate
+``text_complete`` to another configured variant (e.g. Ideogram → OpenAI); that
+is still an API call, not a local corpus fallback.
+
+Style-pool bootstrap (`scripts.phase0_setup`) uses deterministic PIL strokes
+only when **no** image ``adapter`` is passed to ``populate_pools``.
 """
 
 from __future__ import annotations

@@ -73,6 +73,135 @@ def build_mask(
     return mask
 
 
+def _luma_rgb(c: tuple[int, int, int]) -> float:
+    return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+
+
+def _median_channel(samples: list[tuple[int, int, int]], ch: int) -> float:
+    arr = sorted(c[ch] for c in samples)
+    n = len(arr)
+    mid = n // 2
+    if n % 2:
+        return float(arr[mid])
+    return (arr[mid - 1] + arr[mid]) / 2.0
+
+
+def match_paper_tone_in_mask(
+    original_patch: Image.Image,
+    inpainted_patch: Image.Image,
+    mask_l: Image.Image,
+    *,
+    paper_luma_floor: float = 168.0,
+    full_correct_luma: float = 172.0,
+    partial_correct_luma: float = 95.0,
+    ink_luma_cap_ref: float = 95.0,
+    ink_luma_cap_edit: float = 100.0,
+) -> Image.Image:
+    """Nudge paper- and ink-like pixels inside the edit mask toward local statistics.
+
+    Uses **median** colors from unmasked paper (high lumen) and unmasked print (low
+    lumen) so nearby line text does not skew the reference mean. Reduces flat white
+    inpaint patches and ``too gray`` model glyphs vs thermal ink.
+    """
+
+    if (
+        original_patch.size != inpainted_patch.size
+        or mask_l.size != original_patch.size
+    ):
+        return inpainted_patch
+    orig = original_patch if original_patch.mode == "RGB" else original_patch.convert(
+        "RGB"
+    )
+    inp = (
+        inpainted_patch
+        if inpainted_patch.mode == "RGB"
+        else inpainted_patch.convert("RGB")
+    )
+    m = mask_l if mask_l.mode == "L" else mask_l.convert("L")
+    w, h = orig.size
+    px = orig.load()
+    po = inp.load()
+    mh = m.load()
+
+    ref_vals: list[tuple[int, int, int]] = []
+    for y in range(h):
+        for x in range(w):
+            if mh[x, y] < 128:
+                ref_vals.append(px[x, y])
+    if len(ref_vals) < 8:
+        return inpainted_patch
+
+    def _paper_samples(luma_min: float) -> list[tuple[int, int, int]]:
+        return [c for c in ref_vals if _luma_rgb(c) >= luma_min]
+
+    ref_paper = _paper_samples(paper_luma_floor)
+    if len(ref_paper) < 4:
+        ref_paper = _paper_samples(150.0)
+    if len(ref_paper) < 4:
+        ref_paper = _paper_samples(130.0)
+    if len(ref_paper) < 2:
+        return inpainted_patch
+
+    edit_paper: list[tuple[int, int, int]] = []
+    for y in range(h):
+        for x in range(w):
+            if mh[x, y] < 128:
+                continue
+            c = po[x, y]
+            if _luma_rgb(c) >= paper_luma_floor:
+                edit_paper.append(c)
+    if len(edit_paper) < 2:
+        return inpainted_patch
+
+    rp = tuple(_median_channel(ref_paper, i) for i in range(3))
+    ep = tuple(_median_channel(edit_paper, i) for i in range(3))
+    dr_p = rp[0] - ep[0]
+    dg_p = rp[1] - ep[1]
+    db_p = rp[2] - ep[2]
+
+    ref_ink = [c for c in ref_vals if _luma_rgb(c) <= ink_luma_cap_ref]
+    edit_ink: list[tuple[int, int, int]] = []
+    for y in range(h):
+        for x in range(w):
+            if mh[x, y] < 128:
+                continue
+            c = po[x, y]
+            if _luma_rgb(c) <= ink_luma_cap_edit:
+                edit_ink.append(c)
+
+    dr_i = dg_i = db_i = 0.0
+    if len(ref_ink) >= 6 and len(edit_ink) >= 6:
+        ri = tuple(_median_channel(ref_ink, i) for i in range(3))
+        ei = tuple(_median_channel(edit_ink, i) for i in range(3))
+        dr_i, dg_i, db_i = ri[0] - ei[0], ri[1] - ei[1], ri[2] - ei[2]
+
+    out_img = inp.copy()
+    ol = out_img.load()
+    span = max(full_correct_luma - partial_correct_luma, 1e-6)
+    for y in range(h):
+        for x in range(w):
+            if mh[x, y] < 128:
+                continue
+            r, g, b = po[x, y]
+            L = _luma_rgb((r, g, b))
+            if L >= full_correct_luma:
+                dr, dg, db = dr_p, dg_p, db_p
+            elif L >= partial_correct_luma:
+                t = (L - partial_correct_luma) / span
+                dr, dg, db = dr_p * t, dg_p * t, db_p * t
+            elif L <= ink_luma_cap_edit and len(ref_ink) >= 6 and len(edit_ink) >= 6:
+                t_i = min(1.0, (ink_luma_cap_edit - L) / max(ink_luma_cap_edit, 1e-6))
+                dr, dg, db = dr_i * t_i, dg_i * t_i, db_i * t_i
+            else:
+                continue
+            ol[x, y] = (
+                max(0, min(255, int(round(r + dr)))),
+                max(0, min(255, int(round(g + dg)))),
+                max(0, min(255, int(round(b + db)))),
+            )
+    return out_img
+
+
 def apply_inpaint_local(
     image: Image.Image,
     mask: Image.Image,
@@ -82,6 +211,7 @@ def apply_inpaint_local(
     seed: int,
     max_side: int = 2048,
     feather_boundary: bool = True,
+    paper_tone_match: bool = True,
 ) -> Image.Image:
     """Inpaint only the mask bounding box and paste it back into ``image``.
 
@@ -96,13 +226,32 @@ def apply_inpaint_local(
     When ``feather_boundary`` is True, the inpainted patch is alpha-blended
     into the original crop using a blurred mask so the paste does not leave a
     hard rectangular seam.
+
+    When ``paper_tone_match`` is True, bright pixels inside the model output's
+    masked region are shifted to match mean paper color sampled from the
+    unmasked crop (reduces flat white inpaint boxes on gray scans).
     """
 
     m = mask if mask.mode == "L" else mask.convert("L")
-    bbox = m.point(lambda p: 255 if p > 127 else 0, mode="L").getbbox()
+    mb = m.point(lambda p: 255 if p > 127 else 0, mode="L")
+    bbox = mb.getbbox()
     if bbox is None:
         return image.copy()
-    l, t, r, b = bbox
+    l0, t0, r0, b0 = bbox
+    # Tight bbox crop would make ``m_patch`` solid white everywhere. Several
+    # inpaint APIs (e.g. Ideogram edit-v3) reject masks that decode to a single
+    # color — they require both black and white pixels. Expand the crop by a
+    # few pixels so the patch includes visible background (black) around the
+    # white edit rectangle, while keeping the bbox small for cost.
+    iw, ih = image.size
+    pw0, ph0 = r0 - l0, b0 - t0
+    # Extra context helps ``match_paper_tone_in_mask`` sample true paper pixels; a
+    # few pixels of pad skews the reference when the crop is mostly mask + glyphs.
+    pad = max(24, min(96, max(pw0, ph0) // 3))
+    l = max(0, l0 - pad)
+    t = max(0, t0 - pad)
+    r = min(iw, r0 + pad)
+    b = min(ih, b0 + pad)
     patch = image.crop((l, t, r, b))
     m_patch = m.crop((l, t, r, b))
     pw, ph = patch.size
@@ -117,15 +266,49 @@ def apply_inpaint_local(
     out = out.convert("RGB")
     if out.size != patch.size:
         out = out.resize(patch.size, Image.LANCZOS)
+    if paper_tone_match:
+        out = match_paper_tone_in_mask(patch, out, m_patch)
     if feather_boundary:
         mask_bin = m_patch.point(lambda p: 255 if p > 127 else 0, mode="L")
-        blur_r = max(1.0, min(pw, ph) * 0.03)
+        blur_r = max(1.5, min(pw, ph) * 0.055)
         mask_soft = mask_bin.filter(ImageFilter.GaussianBlur(radius=blur_r))
         patch_rgb = patch.convert("RGB")
         out = Image.composite(out, patch_rgb, mask_soft)
     base = image.copy()
     base.paste(out, (l, t))
     return base.convert("RGB")
+
+
+def apply_full_image_inpaint(
+    image: Image.Image,
+    *,
+    adapter: VariantAdapter,
+    prompt: str,
+    seed: int,
+    max_side: int = 2048,
+) -> Image.Image:
+    """Call ``adapter.inpaint`` with the **entire** frame marked editable.
+
+    Use when the prompt instructs the model to reproduce the same document image
+    and change only a global field (e.g. date). Avoids cropping to a date bbox;
+    providers still see the full receipt as reference. Output is resized back to
+    ``image`` dimensions when the API returns a different size.
+    """
+
+    rgb = image.convert("RGB")
+    iw, ih = rgb.size
+    scale = min(1.0, max_side / max(iw, ih)) if max(iw, ih) > max_side else 1.0
+    if scale < 1.0:
+        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        img_in = rgb.resize((nw, nh), Image.LANCZOS)
+    else:
+        img_in = rgb
+    mask = Image.new("L", img_in.size, 255)
+    out = adapter.inpaint(img_in, mask, prompt, seed)
+    out = out.convert("RGB")
+    if out.size != rgb.size:
+        out = out.resize(rgb.size, Image.LANCZOS)
+    return out
 
 
 def burn_text(

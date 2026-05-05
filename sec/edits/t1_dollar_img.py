@@ -1,33 +1,47 @@
 """X-T1-DOLLAR-IMG: change a dollar amount on a SROIE receipt (spec §6 Tier 1).
 
 Sub-variants (half-and-half within a batch by item index):
-- Consistent   : recompute subtotal / tax / total and inpaint all affected fields.
-- Inconsistent : inpaint only the changed line item + the new total, leaving
+- Consistent   : recompute subtotal / tax / total and forge all affected fields
+  in-mask via ``adapter.inpaint``.
+- Inconsistent : forge only the changed line item + the new total, leaving
                  subtotal and tax wrong on purpose.
 
-The inpainter receives a short *erase-only* prompt (no new amounts); amounts
-are re-drawn locally with ``burn_text_matched``. Full spec text per region is
-still recorded in ``DollarEditResult.prompt`` for audit.
+The multimodal adapter is instructed with **image in → image out**: each masked
+region must render ``new_text`` as printed amounts. There is no local burn
+fallback on adapter failure. Full spec text per region is still appended to
+``DollarEditResult.prompt`` for audit.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from PIL import Image
 
-from ..adapters.base import AdapterCapabilityError, AdapterCredentialError, VariantAdapter
-from ..ocr.tesseract import detect_font
+from ..adapters.base import VariantAdapter
 from ..sources.sroie import SROIEItem, Task1Line
 from .common import (
+    apply_full_image_inpaint,
     apply_inpaint_local,
     build_mask,
     dollar_factor_for,
     format_amount_like,
     parse_amount,
 )
-from .font_match import burn_text_matched, recolor_patch_to_paper
+
+def _inpaint_prompt_api_forge_amount(old_text: str, new_text: str, *, kind: str) -> str:
+    """Instructions for ``adapter.inpaint``: same-size image out; amounts forged in-mask."""
+
+    return (
+        "Input: this receipt image with a white painted mask over one monetary line. "
+        "Output: the full receipt image at the **same pixel dimensions** as the input. "
+        "Edit **only** inside the mask. Replace the printed line that reads "
+        f'approximately "{old_text}" with exactly "{new_text}". '
+        f"(Field intent: {kind} — preserve currency prefixes, commas, decimals, minus "
+        "signs, or rupiah style to match neighbouring amounts.) Match thermal receipt "
+        "monospace digits. Do not change any pixel outside the masked region. "
+        "Do not add borders, shaded boxes, watermarks, or blur halos."
+    )
 
 
 @dataclass
@@ -51,14 +65,6 @@ class DollarEditResult:
 
 
 _AMOUNT_LINE_HINTS = ("TOTAL", "SUBTOTAL", "RM", "TAX", "GST", "VAT", "AMOUNT")
-
-_INPAINT_PROMPT_ERASE = (
-    "Edit ONLY inside the white painted mask. Completely remove currency amounts, "
-    "digits, symbols, commas, decimals, and all printed ink inside that mask. Fill "
-    "with seamless blank receipt paper matching neighboring brightness and grain. "
-    "Do NOT write any replacement numbers or text in the masked area. Do not draw "
-    "borders, outlines, shadows, blur halos, or colored sticker patches."
-)
 
 
 # Verbatim from the Synthetic Evidence Corpus spec, §6 Tier 1, X-T1-DOLLAR-IMG.
@@ -105,6 +111,26 @@ def _build_dollar_prompt(
     )
 
 
+def _inpaint_prompt_full_image_dollar(
+    changes: list[tuple[str, str, str]], *, sub_variant: str
+) -> str:
+    """One-shot full-frame prompt listing every amount replacement."""
+
+    lines = "\n".join(
+        f'- ({kind}) replace printed amount "{old}" with exactly "{new}".'
+        for old, new, kind in changes
+    )
+    return (
+        "Recreate this receipt image to match the input in layout, lighting, paper "
+        "texture, and every line of text—except apply ONLY these monetary updates:\n"
+        f"{lines}\n"
+        f"Math intent (dataset sub-variant): {sub_variant}. "
+        "Preserve currency symbols, thousands separators, and decimal style from "
+        "neighbouring amounts. Do not add boxes, borders, or watermarks. "
+        "Output one RGB image with the same width and height as the input."
+    )
+
+
 def _guess_amount_lines(item: SROIEItem) -> list[Task1Line]:
     """Return task1 lines that look like currency amounts."""
 
@@ -144,7 +170,7 @@ def apply(
     adapter: VariantAdapter,
     item_index: int,
     seed: int,
-    forbid_adapter_fallback: bool = False,
+    image_edit_scope: str = "full_image",
 ) -> DollarEditResult:
     if not item.has_task2():
         raise ValueError(f"Item {item.doc_id} has no task2 KV; cannot locate total")
@@ -188,12 +214,73 @@ def apply(
     original = Image.open(item.image_path).convert("RGB")
     image = original.copy()
     edited: list[RegionEdit] = []
-    notes = ""
     prompts_used: list[str] = []
+
+    scope = (image_edit_scope or "full_image").strip().lower()
+    if scope not in ("full_image", "patch"):
+        scope = "full_image"
+
+    line_new = _mimic_amount_format(picked_line.text, new_line_value)
+    total_line = _find_total_line(item, old_total, exclude=picked_line)
+    total_new: str | None = None
+    if total_line is not None:
+        total_new = _mimic_amount_format(total_line.text, new_total)
+
+    regions_queue: list[tuple[Task1Line, str, str]] = [
+        (picked_line, line_new, "line_item"),
+    ]
+    if total_line is not None and total_new is not None:
+        regions_queue.append((total_line, total_new, "total"))
+
+    if scope == "full_image":
+        changes: list[tuple[str, str, str]] = [
+            (ln.text.strip(), new_txt, kind) for ln, new_txt, kind in regions_queue
+        ]
+        forge_prompt = _inpaint_prompt_full_image_dollar(changes, sub_variant=sub_variant)
+        spec_blocks = [
+            _build_dollar_prompt(
+                bbox=ln.bbox(),
+                old_text=ln.text,
+                new_text=new_txt,
+                factor=factor,
+                sub_variant=sub_variant,
+                kind=kind,
+            )
+            for ln, new_txt, kind in regions_queue
+        ]
+        prompts_used.append(
+            f"{forge_prompt}\n\n(Audit/spec per region)\n" + "\n---\n".join(spec_blocks)
+        )
+        image = apply_full_image_inpaint(
+            original,
+            adapter=adapter,
+            prompt=forge_prompt,
+            seed=seed,
+        )
+        for ln, new_txt, kind in regions_queue:
+            edited.append(
+                RegionEdit(bbox=ln.bbox(), old_text=ln.text, new_text=new_txt, kind=kind)
+            )
+        return DollarEditResult(
+            image=image,
+            sub_variant=sub_variant,
+            factor=factor,
+            old_total=old_total,
+            new_total=new_total,
+            edited_regions=edited,
+            prompt=(
+                "### Tier-1 dollar — API full-frame inpaint\n"
+                + "\n\n---\n\n".join(prompts_used)
+            ),
+            notes="",
+        )
 
     def _edit_region(line: Task1Line, new_text: str, kind: str) -> None:
         nonlocal image
         bbox = line.bbox()
+        forge_prompt = _inpaint_prompt_api_forge_amount(
+            line.text.strip(), new_text, kind=kind
+        )
         region_prompt = _build_dollar_prompt(
             bbox=bbox,
             old_text=line.text,
@@ -202,47 +289,24 @@ def apply(
             sub_variant=sub_variant,
             kind=kind,
         )
-        prompts_used.append(region_prompt)
-        mask = build_mask(image.size, bbox, expand=0.1)
-        inpaint_succeeded = False
-        try:
-            image = apply_inpaint_local(
-                image,
-                mask,
-                adapter=adapter,
-                prompt=_INPAINT_PROMPT_ERASE,
-                seed=seed,
-            )
-            inpaint_succeeded = True
-        except (AdapterCapabilityError, AdapterCredentialError) as e:
-            if forbid_adapter_fallback:
-                raise
-            nonlocal notes
-            notes = f"adapter_fallback: {e}"
-        if inpaint_succeeded:
-            # Pull the model's patch toward the surrounding paper RGB so
-            # the inpainted area is not visibly tinted (mustard / gray).
-            image = recolor_patch_to_paper(image, bbox, color_reference=original)
-        # Spec §6 T1 step 4: burn the new amount with a matched font, ink,
-        # and width — sample colors from the unmodified scan so the new
-        # digits look like they came off the same printer.
-        font_hint = detect_font(item.image_path, bbox)
-        mono_hint = bool(font_hint and "Mono" in font_hint)
-        image = burn_text_matched(
-            image,
-            new_text,
-            bbox,
-            color_reference=original,
-            mono_hint=mono_hint,
-            seed=seed,
-            fill_paper_first=True,
+        prompts_used.append(
+            f"{forge_prompt}\n\n(Audit/spec)\n{region_prompt}"
         )
-        edited.append(RegionEdit(bbox=bbox, old_text=line.text, new_text=new_text, kind=kind))
+        mask = build_mask(image.size, bbox, expand=0.1)
+        image = apply_inpaint_local(
+            image,
+            mask,
+            adapter=adapter,
+            prompt=forge_prompt,
+            seed=seed,
+        )
+        edited.append(
+            RegionEdit(bbox=bbox, old_text=line.text, new_text=new_text, kind=kind)
+        )
 
-    _edit_region(picked_line, _mimic_amount_format(picked_line.text, new_line_value), "line_item")
-    total_line = _find_total_line(item, old_total, exclude=picked_line)
-    if total_line is not None:
-        _edit_region(total_line, _mimic_amount_format(total_line.text, new_total), "total")
+    _edit_region(picked_line, line_new, "line_item")
+    if total_line is not None and total_new is not None:
+        _edit_region(total_line, total_new, "total")
 
     return DollarEditResult(
         image=image,
@@ -252,11 +316,11 @@ def apply(
         new_total=new_total,
         edited_regions=edited,
         prompt=(
-            "### API inpaint (paper erase only, every region)\n"
-            f"{_INPAINT_PROMPT_ERASE}\n\n### Spec procedure per region (audit)\n"
+            "### Tier-1 dollar — API inpaint (image → forged amounts per mask)\n"
+            "Each block below is forge instructions plus audit/spec text for one region.\n\n"
             + "\n\n---\n\n".join(prompts_used)
         ),
-        notes=notes,
+        notes="",
     )
 
 

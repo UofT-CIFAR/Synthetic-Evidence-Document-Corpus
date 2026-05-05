@@ -66,3 +66,16 @@ ocr:
 seeds:
   base_train: 11000
   base_test: 81000
+
+# Global inpainting style for every tier that calls ``adapter.inpaint`` (T1 date/dollar,
+# T2 signature/handwriting, T3 line insert). Variants A/B/C/D all use the same scope.
+# `full_image`: whole frame editable, one API call (clone-style prompts).
+# `patch`: bbox/crop inpaint + composite (legacy; smaller crops).
+# Tier 4 uses ``few_shot_image`` only (no local receipt renderer).
+image_edit:
+  scope: full_image # full_image | patch
+
+# Tier-1 date: default is **full-frame API inpaint only** (no local fallback on errors).
+# Set `use_local_burn_only: true` for offline `burn_text_matched` without calling the API.
+tier1_date:
+  use_local_burn_only: false

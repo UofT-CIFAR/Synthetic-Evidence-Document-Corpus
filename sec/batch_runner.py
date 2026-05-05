@@ -47,6 +47,28 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
 
+def _image_edit_scope(tools: dict[str, Any] | None) -> str:
+    """``full_image`` | ``patch`` for all tiers that call ``adapter.inpaint``."""
+
+    if not tools:
+        return "full_image"
+    ie = tools.get("image_edit")
+    if isinstance(ie, dict):
+        s = str(ie.get("scope", "full_image")).strip().lower()
+        if s in ("full_image", "patch"):
+            return s
+    return "full_image"
+
+
+def _tier1_date_use_local_burn_only(tools: dict[str, Any] | None) -> bool:
+    """True only when ``tier1_date.use_local_burn_only`` is set (offline dev)."""
+
+    if not tools:
+        return False
+    td = tools.get("tier1_date")
+    return bool(isinstance(td, dict) and td.get("use_local_burn_only", False))
+
+
 class BatchRunner:
     def __init__(
         self,
@@ -88,8 +110,7 @@ class BatchRunner:
         self.out_dir = config.corpus_batch_dir(batch.pool, batch.family, batch.batch_id)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._items_cache: dict[str, SROIEItem] | None = None
-        # Variant B (Gemini) must not report success when the pipeline silences API failure.
-        self._forbid_adapter_fallback = batch.variant == "B"
+        self._image_edit_scope = _image_edit_scope(config.tools)
 
     # -- helpers ----------------------------------------------------------
 
@@ -264,13 +285,14 @@ class BatchRunner:
         # (common on CORD), silently fall through to a DOLLAR edit so the
         # batch still fills out to `items`.
         if item_index % 2 == 0:
+            burn_only = _tier1_date_use_local_burn_only(self.config.tools)
             try:
                 res = t1_date_img.apply(
                     source,
                     adapter=self.adapter,
                     item_index=item_index,
                     seed=self.batch.seed * 1000 + item_index,
-                    forbid_adapter_fallback=self._forbid_adapter_fallback,
+                    use_local_burn_only=burn_only,
                 )
             except ValueError as e:
                 LOG.info(
@@ -301,7 +323,7 @@ class BatchRunner:
             adapter=self.adapter,
             item_index=item_index,
             seed=self.batch.seed * 1000 + item_index,
-            forbid_adapter_fallback=self._forbid_adapter_fallback,
+            image_edit_scope=self._image_edit_scope,
         )
         patch = {
             "_source": source,
@@ -336,7 +358,7 @@ class BatchRunner:
                 pool=self.batch.pool,
                 item_index=item_index,
                 batch_seed_value=self.batch.seed,
-                forbid_adapter_fallback=self._forbid_adapter_fallback,
+                image_edit_scope=self._image_edit_scope,
             )
             patch = {
                 "_source": source,
@@ -361,16 +383,16 @@ class BatchRunner:
                 ),
             }
             return res.image, patch, res.prompt, ""
-        res = t2_hw.apply(
-            source,
-            adapter=self.adapter,
-            pools=self.style_pools,
-            pool=self.batch.pool,
-            item_index=item_index,
-            batch_seed_value=self.batch.seed,
-            assets_dir=ASSETS_DIR,
-            forbid_adapter_fallback=self._forbid_adapter_fallback,
-        )
+            res = t2_hw.apply(
+                source,
+                adapter=self.adapter,
+                pools=self.style_pools,
+                pool=self.batch.pool,
+                item_index=item_index,
+                batch_seed_value=self.batch.seed,
+                assets_dir=ASSETS_DIR,
+                image_edit_scope=self._image_edit_scope,
+            )
         patch = {
             "_source": source,
             "identity_seed": res.identity_seed,
@@ -402,7 +424,7 @@ class BatchRunner:
             seed=self.batch.seed * 1000 + item_index,
             assets_dir=ASSETS_DIR,
             prompts_dir=PROMPTS_DIR,
-            forbid_adapter_fallback=self._forbid_adapter_fallback,
+            image_edit_scope=self._image_edit_scope,
         )
         patch = {
             "_source": source,
@@ -429,7 +451,6 @@ class BatchRunner:
             item_index=item_index,
             batch_seed_value=self.batch.seed,
             prompts_dir=PROMPTS_DIR,
-            forbid_adapter_fallback=self._forbid_adapter_fallback,
         )
         patch = {
             "_source": None,

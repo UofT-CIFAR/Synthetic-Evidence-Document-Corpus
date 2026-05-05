@@ -130,17 +130,14 @@ def populate_pools(
             for ref_i in range(refs_per_style):
                 ref_seed = (style_index * 1000) + ref_i + (1 if pool_name == "test" else 0)
                 phrase = phrases[ref_i % len(phrases)]
-                img: Image.Image | None = None
+                img: Image.Image
                 if adapter is not None:
-                    try:
-                        img = adapter.few_shot_image(
-                            refs=[],
-                            prompt=f"clean black-ink {phrase} handwriting, transparent background",
-                            seed=ref_seed,
-                        )
-                    except Exception:
-                        img = None
-                if img is None:
+                    img = adapter.few_shot_image(
+                        refs=[],
+                        prompt=f"clean black-ink {phrase} handwriting, transparent background",
+                        seed=ref_seed,
+                    )
+                else:
                     img = _fallback_stroke(phrase, ref_seed)
                 out = style_dir / f"ref_{ref_i:02d}.png"
                 img.save(out, format="PNG")

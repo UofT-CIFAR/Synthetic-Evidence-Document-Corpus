@@ -4,6 +4,7 @@ Examples::
 
     PYTHONPATH=. python -m scripts.clean_manifest dedupe
     PYTHONPATH=. python -m scripts.clean_manifest remove-batch TRN-RCT-T1-B-CORD
+    PYTHONPATH=. python -m scripts.clean_manifest keep-clean-corpus
     PYTHONPATH=. python -m scripts.clean_manifest empty --i-am-sure
 """
 
@@ -20,6 +21,7 @@ from sec.manifest import (  # noqa: E402
     clear_manifest,
     dedupe_by_artifact_keep_latest,
     remove_rows_for_batch,
+    remove_rows_not_under_clean_corpus,
 )
 
 
@@ -48,6 +50,11 @@ def main() -> int:
         help="Confirm you want to delete all manifest rows",
     )
 
+    sub.add_parser(
+        "keep-clean-corpus",
+        help="Drop rows whose file_path is not under corpus/.../__clean__* (keeps tier 99)",
+    )
+
     args = parser.parse_args()
     cfg = load_config()
     path = cfg.manifest_path
@@ -68,6 +75,11 @@ def main() -> int:
             return 2
         clear_manifest(path)
         print(f"{path}: cleared (0 rows)")
+        return 0
+
+    if args.cmd == "keep-clean-corpus":
+        before, after = remove_rows_not_under_clean_corpus(path)
+        print(f"{path}: {before} -> {after} rows (kept clean corpus paths + tier 99)")
         return 0
 
     return 1

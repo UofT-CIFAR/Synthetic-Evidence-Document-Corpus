@@ -37,9 +37,12 @@ export COMFYUI_URL=http://localhost:8188
 ```
 
 Any adapter whose credentials are absent will raise
-`AdapterCredentialError` when a batch tries to use it; tier code catches that
-error and records a `adapter_fallback:` note in the manifest so the pipeline
-remains runnable offline for ground-truth / provenance / QA validation.
+`AdapterCredentialError` when a batch tries to use it; the item then **fails**
+in the batch runner (no local substitute image).
+
+Style-pool Phase 0 can still use deterministic PIL reference strokes when no
+ComfyUI adapter is available (see `populate_pools`); re-run pool generation with
+an API when you need provider-generated refs.
 
 ## Running the pipeline
 
@@ -97,19 +100,25 @@ variant-agnostic.
 
 - **T1 (date / dollar)** uses the SROIE task2 JSON (`company`, `date`,
   `total`) as ground truth for the edit target, cross-referencing task1 OCR
-  polygons to locate the bounding box precisely. Sub-variants: consistent vs
-  inconsistent (half / half by item index).
-- **T2 (signature / handwriting)** loads references from the style pool
-  `style_pools/signatures/<pool>/style_<idx>/`, calls the adapter's
-  `few_shot_image`, applies per-item perturbation (rot ±2°, scale ±5°,
-  shear ±2°, HSV ink jitter), and composites onto a signature-line or
-  margin region.
+  polygons to locate the bounding box precisely. **Dates** use **full-frame
+  `adapter.inpaint` only** (same receipt, new date); there is no local fallback
+  unless `tier1_date.use_local_burn_only: true`. **`image_edit.scope`** affects
+  **dollar** (and T2/T3), not the date API shape. **Dollar** edits use
+  ``adapter.inpaint`` only (full frame or patch); there is no local burn on
+  failure.
+  Sub-variants: consistent vs inconsistent dollar
+  edits (half / half by item index).
+- **T2 (signature / handwriting)** uses `image_edit.scope`: `full_image` calls
+  `adapter.inpaint` on the full frame with a region hint; **failure stops the
+  item** (no patch/composite fallback). `patch` uses `few_shot_image` + local
+  composite of **API** glyphs only.
 - **T3 (line-item insertion)** drafts a new receipt line via
   `text_complete` conditioned on a target from `assets/clause_targets.txt`,
-  then inpaints an empty row above the subtotal and burns the drafted text in.
-- **T4 (whole-receipt fabrication)** asks the text adapter to produce a
-  structured JSON receipt with 3 SROIE anchors as style examples, then
-  renders it through the shared `sec/renderer.py` Pillow renderer.
+  then runs `adapter.inpaint` (`full_image` or masked strip per `image_edit.scope`).
+  **There is no local burn fallback** on vision failure.
+- **T4 (whole-receipt fabrication)** calls `adapter.few_shot_image` with up to
+  three SROIE anchor images plus `prompts/T4-RCT-image.md`; the API raster is
+  the artifact (no JSON + Pillow path).
 
 ## Determinism
 

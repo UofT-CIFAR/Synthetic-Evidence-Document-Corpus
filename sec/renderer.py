@@ -1,8 +1,7 @@
-"""Deterministic renderer used by Tier-4 fabrication and all tool variants.
+"""Deterministic renderer for structured receipt dicts (legacy utilities / tests).
 
-Its job is to turn a structured receipt dict into a PIL image that looks like
-a thermal-printed receipt. Because every variant uses the same renderer when
-handed structured JSON, it does not contribute a detector shortcut.
+Its job is to turn structured fields into a PIL image that resembles a
+thermal-printed receipt.
 """
 
 from __future__ import annotations
