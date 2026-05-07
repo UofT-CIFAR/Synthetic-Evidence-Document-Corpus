@@ -1,12 +1,14 @@
-"""Run every FindIt2 RCT batch (32 batches; non-forged sources only).
+"""Run every FindIt2 RCT batch (32 batches; clean sources only).
 
 Usage:
 
     python -m scripts.run_all_findit2                    # all 32 FindIt2 batches
+    python -m scripts.run_all_findit2 --skip-existing       # reruns cheaper
     python -m scripts.run_all_findit2 --only-tier T1
     python -m scripts.run_all_findit2 --only-variant A
     python -m scripts.run_all_findit2 --only-pool TRN
     python -m scripts.run_all_findit2 --dry-run
+    python -m scripts.run_all_findit2 --only-variant B --skip-forged-sources
 """
 
 from __future__ import annotations
@@ -32,6 +34,19 @@ def main() -> int:
     parser.add_argument("--only-variant", choices=["A", "B", "C", "D"])
     parser.add_argument("--only-pool", choices=["TRN", "TST"])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Forwarded to run_batch: skip slots with PNG + manifest row for that item_index.",
+    )
+    parser.add_argument(
+        "--skip-forged-sources",
+        action="store_true",
+        help=(
+            "Forwarded to run_batch: skip source docs that already have a forged PNG "
+            "under corpus/ (manifest + on-disk file, excludes __clean__ paths)."
+        ),
+    )
     args = parser.parse_args()
 
     configure_root_logger()
@@ -50,7 +65,12 @@ def main() -> int:
     failures = 0
     for b in batches:
         try:
-            rc = run_one(cfg, b)
+            rc = run_one(
+                cfg,
+                b,
+                skip_existing=args.skip_existing,
+                skip_forged_sources=args.skip_forged_sources,
+            )
             if rc:
                 failures += 1
         except Exception:

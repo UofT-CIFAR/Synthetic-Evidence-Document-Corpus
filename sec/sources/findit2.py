@@ -13,7 +13,8 @@ FindIt2 is a SROIE-derived receipts dataset that ships:
 For the SEC pipeline we want CLEAN inputs to apply our own four-tier
 manipulations to, so:
 
-- We expose **non-forged** items (``forged == 0``) by default.
+- We expose **non-forged** items (``forged == 0``) by default, and omit any
+    row listed in CSV with nonempty **forgery annotations** (prior forger polygons).
 - We bbox-rebuild ``task1_lines`` with Tesseract ``image_to_data`` (word-level
   boxes), producing one ``Task1Line`` per word and one merged-polygon line per
   Tesseract line so ``find_line_for_text`` can resolve both single tokens and
@@ -46,7 +47,8 @@ _FINDIT_ITEMS_CACHE: dict[str, list["SROIEItem"]] = {}
 
 
 def _findit_items_cache_key(root: Path, splits: tuple[str, ...], include_forged: bool) -> str:
-    return f"{root.resolve()}|{','.join(splits)}|{int(include_forged)}"
+    # Bump cache version when exclusion rules change (forged CSV + forgery polygons).
+    return f"{root.resolve()}|{','.join(splits)}|{int(include_forged)}|exc_ann_v1"
 
 
 _DATE_RE = re.compile(
@@ -296,7 +298,10 @@ def enumerate_clean_doc_ids(
     *,
     splits: tuple[str, ...] = ("train", "val", "test"),
 ) -> list[str]:
-    """Return sorted ``FIN-<split>-<stem>`` ids for non-forged PNGs (no OCR).
+    """Return sorted ``FIN-<split>-<stem>`` ids for clean PNGs (no OCR).
+
+    Excludes rows with ``forged == 1`` and rows whose ``forgery annotations``
+    column lists prior manipulation polygons, per split CSV (train/val/test).
 
     Use this for fast pool-split sidecars; the full :class:`FindIt2Loader`
     still runs Tesseract when batches need precise polygons.
@@ -310,31 +315,42 @@ def enumerate_clean_doc_ids(
         if not split_dir.exists():
             continue
         forged_flags = _read_split_index(split_csv)
+        forgery_regions = _read_forgery_annotations(split_csv)
         for img_path in sorted(split_dir.glob("*.png")):
             fname = img_path.name
             if forged_flags.get(fname, 0):
+                continue
+            if fname in forgery_regions:
                 continue
             out.append(f"FIN-{split}-{img_path.stem}")
     return sorted(out)
 
 
-def count_pngs_and_forged(root: Path | str) -> tuple[int, int]:
-    """Return ``(n_pngs, n_forged_in_csv)`` for statistics logging."""
+def count_pngs_and_forged(root: Path | str) -> tuple[int, int, int]:
+    """Return ``(n_pngs, n_csv_forged, n_with_forgery_annotation_column)``.
+
+    The third count is receipts listed in CSV with nonempty ``forgery
+    annotations`` polygons (prior touch-ups); excluded from ``enumerate_clean_doc_ids``.
+    """
 
     root = Path(root)
     n_png = 0
     n_forged = 0
+    n_forgery_ann_rows = 0
     for split in ("train", "val", "test"):
         split_csv = root / f"{split}.txt"
         split_dir = root / split
         if not split_dir.exists():
             continue
         forged_flags = _read_split_index(split_csv) if split_csv.exists() else {}
+        forgery_regions = _read_forgery_annotations(split_csv) if split_csv.exists() else {}
         for p in split_dir.glob("*.png"):
             n_png += 1
             if forged_flags.get(p.name, 0):
                 n_forged += 1
-    return n_png, n_forged
+            if p.name in forgery_regions:
+                n_forgery_ann_rows += 1
+    return n_png, n_forged, n_forgery_ann_rows
 
 
 def _build_task2(transcript: list[str], task1_lines: list[Task1Line]) -> dict[str, str]:
@@ -358,8 +374,9 @@ class FindIt2Loader:
     splits:
         Which on-disk splits to scan. Default: all three.
     include_forged:
-        If ``False`` (default), skip rows whose CSV row has ``forged == 1``
-        so we never seed the SEC pipeline with another forger's receipts.
+        If ``False`` (default), skip CSV rows where ``forged == 1`` or the
+        ``forgery annotations`` column indicates prior manipulated regions so
+        the SEC pipeline only runs on untouched-looking receipts.
     """
 
     SOURCE_DATASET = SOURCE_DATASET
@@ -388,10 +405,13 @@ class FindIt2Loader:
             if not split_dir.exists():
                 continue
             forged_flags = _read_split_index(split_csv)
+            forgery_regions = _read_forgery_annotations(split_csv)
             for img_path in sorted(split_dir.glob("*.png")):
                 fname = img_path.name
                 forged = forged_flags.get(fname, 0)
                 if forged and not self.include_forged:
+                    continue
+                if not self.include_forged and fname in forgery_regions:
                     continue
                 stem = img_path.stem
                 doc_id = f"FIN-{split}-{stem}"

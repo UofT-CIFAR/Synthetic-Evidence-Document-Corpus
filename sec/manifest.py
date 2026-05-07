@@ -11,12 +11,18 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .schema import MANIFEST_SCHEMA, validate_row
+
+if TYPE_CHECKING:
+    from .config import Config
+
+# (resolved manifest path, st_mtime or -1, source_dataset) -> doc ids already forged on disk
+_FORGED_SOURCE_IDS_CACHE: dict[tuple[str, float, str], frozenset[str]] = {}
 
 
 class ManifestError(RuntimeError):
@@ -196,3 +202,57 @@ def load_manifest(manifest_path: Path) -> pa.Table:
 def read_rows(manifest_path: Path) -> list[dict]:
     table = load_manifest(manifest_path)
     return table.to_pylist()
+
+
+def forged_source_ids_in_corpus(config: "Config", *, source_dataset: str) -> frozenset[str]:
+    """Return source document IDs that already have a non-clean artifact file under ``corpus_dir``.
+
+    Rows must match ``source_dataset`` (so SROIE / CORD / FindIt2 IDs do not cross-filter).
+    Clean controls live under paths containing ``__clean__`` and are ignored.
+    """
+
+    manifest_path = Path(config.manifest_path)
+    mtime = manifest_path.stat().st_mtime if manifest_path.exists() else -1.0
+    key = (str(manifest_path.resolve()), mtime, source_dataset)
+    cached = _FORGED_SOURCE_IDS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if not manifest_path.exists():
+        empty: frozenset[str] = frozenset()
+        _FORGED_SOURCE_IDS_CACHE[key] = empty
+        return empty
+
+    corpus_root = Path(config.corpus_dir).resolve()
+    project_root = Path(config.project_root).resolve()
+    found: set[str] = set()
+    for row in read_rows(manifest_path):
+        if row.get("source_dataset") != source_dataset:
+            continue
+        sid = row.get("source_artifact_id")
+        if not sid:
+            continue
+        fp = row.get("file_path")
+        if not fp:
+            continue
+        norm = str(fp).replace("\\", "/")
+        if "__clean__" in norm:
+            continue
+        abs_path = (project_root / fp).resolve()
+        if not abs_path.is_file():
+            continue
+        try:
+            abs_path.relative_to(corpus_root)
+        except ValueError:
+            continue
+        found.add(str(sid))
+
+    out = frozenset(found)
+    _FORGED_SOURCE_IDS_CACHE[key] = out
+    return out
+
+
+def clear_forged_source_ids_cache() -> None:
+    """Test helper: drop memoized results for :func:`forged_source_ids_in_corpus`."""
+
+    _FORGED_SOURCE_IDS_CACHE.clear()

@@ -8,6 +8,9 @@ Given a `BatchSpec`, this module:
 - Writes artifacts with provenance markers, appends manifest rows, and logs
   per-item JSONL.
 - Runs the QA harness and writes `qa/<batch_id>.md`.
+- Optional rerun optimization: skip item slots whose artifact PNG exists and has
+  a matching manifest row (see ``BatchRunner.run(skip_existing=...)`` /
+  ``run_batch.py --skip-existing``).
 
 Acceptance per spec §9.3 is gated at the CLI level in
 `scripts/run_batch.py` by reading the QA report.
@@ -33,7 +36,7 @@ from .config import Config
 from .edits import t1_date_img, t1_dollar_img, t2_hw, t2_sig, t3_insert, t4_rct
 from .edits.common import parse_amount
 from .logging_utils import BatchLogger, new_logger
-from .manifest import append_rows
+from .manifest import append_rows, read_rows
 from .ocr.tesseract import mean_confidence
 from .pools import PoolSplit, sample_ids
 from .provenance import ProvenanceConfig
@@ -81,6 +84,7 @@ class BatchRunner:
         prov_cfg: ProvenanceConfig | None = None,
         source_dataset: str | None = None,
         source_license: str | None = None,
+        exclude_source_ids: frozenset[str] | None = None,
     ) -> None:
         self.config = config
         self.batch = batch
@@ -106,11 +110,34 @@ class BatchRunner:
             prompts_log_dir=config.prompts_log_dir,
             batch_id=batch.batch_id,
         )
+        self._exclude_source_ids = exclude_source_ids or frozenset()
         config.ensure_runtime_dirs()
         self.out_dir = config.corpus_batch_dir(batch.pool, batch.family, batch.batch_id)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._items_cache: dict[str, SROIEItem] | None = None
         self._image_edit_scope = _image_edit_scope(config.tools)
+
+    def _artifact_id(self, item_index: int) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sec:{self.batch.batch_id}:{item_index}"))
+
+    def _manifest_rows_by_item_index(self) -> dict[int, dict]:
+        path = self.config.manifest_path
+        if not path.exists():
+            return {}
+        bid = self.batch.batch_id
+        out: dict[int, dict] = {}
+        for r in read_rows(path):
+            if r.get("batch_id") != bid:
+                continue
+            idx = r.get("item_index")
+            if idx is None:
+                continue
+            try:
+                ix = int(idx)
+            except (TypeError, ValueError):
+                continue
+            out[ix] = r
+        return out
 
     # -- helpers ----------------------------------------------------------
 
@@ -125,6 +152,8 @@ class BatchRunner:
         eligible: list[str] = []
         min_conf = float(self.config.tools.get("ocr", {}).get("min_confidence", 0.85))
         for doc_id in pool_ids:
+            if doc_id in self._exclude_source_ids:
+                continue
             item = cache.get(doc_id)
             if not item:
                 continue
@@ -193,7 +222,7 @@ class BatchRunner:
 
     # -- tier dispatch ----------------------------------------------------
 
-    def run(self) -> dict[str, int]:
+    def run(self, *, skip_existing: bool = False) -> dict[str, int]:
         handlers: dict[str, Callable[[int], tuple[Image.Image, dict, str, str] | None]] = {
             "T1": self._run_t1_item,
             "T2": self._run_t2_item,
@@ -202,9 +231,25 @@ class BatchRunner:
         }
         handler = handlers[self.batch.tier]
         rows: list[dict] = []
-        generated = failed = skipped = 0
+        manifest_by_ix = self._manifest_rows_by_item_index() if skip_existing else {}
+        generated = failed = skipped = skipped_existing = 0
         for i in range(self.batch.items):
             try:
+                if skip_existing:
+                    aid = self._artifact_id(i)
+                    png = self.out_dir / f"{aid}.png"
+                    prev = manifest_by_ix.get(i)
+                    if png.exists() and prev is not None and str(prev.get("artifact_id", "")) == aid:
+                        skipped_existing += 1
+                        self.logger.log_item(
+                            {
+                                "batch_id": self.batch.batch_id,
+                                "item_index": i,
+                                "status": "skipped_existing",
+                                "artifact_id": aid,
+                            }
+                        )
+                        continue
                 result = handler(i)
                 if result is None:
                     skipped += 1
@@ -213,9 +258,7 @@ class BatchRunner:
                     )
                     continue
                 image, row_patch, prompt, raw = result
-                artifact_id = str(
-                    uuid.uuid5(uuid.NAMESPACE_URL, f"sec:{self.batch.batch_id}:{i}")
-                )
+                artifact_id = self._artifact_id(i)
                 marker = self._write(image, artifact_id)
                 row = self._base_row(
                     artifact_id=artifact_id,
@@ -272,7 +315,12 @@ class BatchRunner:
                 )
         if rows:
             append_rows(self.config.manifest_path, rows)
-        return {"generated": generated, "failed": failed, "skipped": skipped}
+        return {
+            "generated": generated,
+            "failed": failed,
+            "skipped": skipped,
+            "skipped_existing": skipped_existing,
+        }
 
     # -- per-tier item handlers ------------------------------------------
 

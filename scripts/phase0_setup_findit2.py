@@ -2,8 +2,9 @@
 
 - Requires ``paths.yaml`` ``sources.findit.root`` pointing at the FindIt2 tree
   (``train/``, ``val/``, ``test/`` with ``*.png`` + ``*.txt`` and split CSVs).
-- **Skips pre-forged images** (``forged == 1`` in ``train.txt`` / ``val.txt`` /
-  ``test.txt``) so the SEC pipeline only manipulates clean receipts.
+- **Skips receipts already tagged as manipulated** per split CSV: ``forged == 1``,
+  and rows with nonempty ``forgery annotations`` polygons, so batches only pull
+  clean-looking sources.
 - Performs the deterministic 75/25 hash-bucket pool split on ``doc_id``.
 - Writes ``configs/pool_split_findit.yaml`` for ``run_batch`` / clean controls.
 
@@ -54,7 +55,7 @@ def main() -> int:
     cfg.ensure_runtime_dirs()
 
     root = Path(cfg.source("findit").root)  # type: ignore[union-attr]
-    n_png, n_forged = count_pngs_and_forged(root)
+    n_png, n_forged, n_forgery_ann = count_pngs_and_forged(root)
     doc_ids = enumerate_clean_doc_ids(root)
     stub = root / ".sec_findit_pool_stub"
     stub.write_bytes(b"")
@@ -73,9 +74,11 @@ def main() -> int:
     ]
 
     LOG.info(
-        "FindIt2: %d on-disk pngs, %d marked forged in CSV (excluded); %d clean doc_ids for pool split",
+        "FindIt2: %d pngs on disk; %d csv forged=1 excluded; "
+        "%d with forgery polygon column excluded; %d clean doc_ids for pool split",
         n_png,
         n_forged,
+        n_forgery_ann,
         len(doc_ids),
     )
 

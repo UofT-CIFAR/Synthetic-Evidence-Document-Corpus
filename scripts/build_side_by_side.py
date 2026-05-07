@@ -12,7 +12,8 @@ placeholder so the panel still surfaces metadata.
 Usage::
 
     python -m scripts.build_side_by_side
-    python -m scripts.build_side_by_side --per-cell 1 --max-side 700
+    python -m scripts.build_side_by_side --per-cell 2 --max-side 700
+    python -m scripts.build_side_by_side --in-corpus   # writes under corpus/side_by_side/
 """
 
 from __future__ import annotations
@@ -277,7 +278,12 @@ def main() -> int:
         "--out",
         type=str,
         default="demo_output/comparisons",
-        help="Output directory (relative to project root)",
+        help="Output directory (relative to project root); ignored if --in-corpus",
+    )
+    parser.add_argument(
+        "--in-corpus",
+        action="store_true",
+        help="Write panels under corpus_dir/side_by_side/ (from configs/paths.yaml)",
     )
     args = parser.parse_args()
 
@@ -299,7 +305,10 @@ def main() -> int:
     picks = _pick_representatives(table_dict, per_cell=args.per_cell)
     print(f"selected {len(picks)} representative artifacts")
 
-    out_dir = cfg.project_root / args.out
+    if args.in_corpus:
+        out_dir = cfg.corpus_dir / "side_by_side"
+    else:
+        out_dir = cfg.project_root / args.out
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
@@ -344,7 +353,7 @@ def main() -> int:
             src_tag = "CORD"
         else:
             src_tag = "SROIE"
-        fname = f"{src_tag}_T{pick.tier}_{pick.variant}_{pick.artifact_id[:8]}.png"
+        fname = f"{src_tag}_T{pick.tier}_{pick.variant}_{pick.artifact_id}.png"
         out_path = out_dir / fname
         panel.save(out_path)
         written.append(out_path)
