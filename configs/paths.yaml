@@ -30,6 +30,17 @@ sources:
     # FindIt2 (SROIE-style receipts: train/val/test with png + plain transcript).
     # Pre-forged rows (forged=1 in split CSV) are excluded by the loader.
     root: /mnt/data/jaleh/CIFAR/Datasets/findit2
+  enron:
+    root: /mnt/data/jaleh/CIFAR/Datasets/Enron_Emails_Dataset
+    # One relative path per line under ``root``; avoids walking the full Enron tree at startup.
+    mail_index: configs/cache/enron_mail_paths.txt
+  avocado:
+    root: /mnt/data/jaleh/CIFAR/Datasets/avocado-1.0.2
+  rvl_cdip_email:
+    # HF mirror chainyo/rvl-cdip — email class only (see ``sec.sources.rvl_cdip_email``).
+    root: /mnt/data/jaleh/CIFAR/Datasets/RVL-CDIP-email-cache
+    hf_cache: /mnt/data/jaleh/CIFAR/Datasets/RVL-CDIP-email-cache/hf
+    hf_name: chainyo/rvl-cdip
 
 pool_split:
   # Disjoint by document ID: hash(doc_id) % 100 < 75 -> train else test.

@@ -1,5 +1,6 @@
-confirm the deadline has been extended
-explain the invoice adjustment
-request a follow-up meeting
-decline the request politely
-approve the revised budget
+confirm invoice totals before close of business
+request countersignature on updated NDA exhibit B
+reschedule calibration window with facilities
+clarify mileage reimbursement cap for Q2 travel
+follow up on vendor SOC2 questionnaire gaps
+archive litigation hold notice to shared drive

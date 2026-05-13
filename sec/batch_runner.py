@@ -115,6 +115,7 @@ class BatchRunner:
         self.out_dir = config.corpus_batch_dir(batch.pool, batch.family, batch.batch_id)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._items_cache: dict[str, SROIEItem] | None = None
+        self._eligible_source_ids_cache: list[str] | None = None
         self._image_edit_scope = _image_edit_scope(config.tools)
 
     def _artifact_id(self, item_index: int) -> str:
@@ -147,6 +148,8 @@ class BatchRunner:
         return self._items_cache
 
     def _eligible_source_ids(self) -> list[str]:
+        if self._eligible_source_ids_cache is not None:
+            return self._eligible_source_ids_cache
         pool_ids = list(self.split.for_pool(self.batch.pool))
         cache = self._ensure_items_cache()
         eligible: list[str] = []
@@ -173,6 +176,7 @@ class BatchRunner:
             if summary and summary.available and summary.mean_confidence < min_conf:
                 continue
             eligible.append(doc_id)
+        self._eligible_source_ids_cache = eligible
         return eligible
 
     def _sample_source(self, item_index: int) -> SROIEItem | None:

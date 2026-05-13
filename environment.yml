@@ -1,0 +1,19 @@
+# Conda environment for the Synthetic Evidence Corpus pipeline.
+# Usage:
+#   cd SyntheticEvidenceCorpus
+#   conda env create -f environment.yml
+#   conda activate sec-corpus
+#
+# OpenCV and PyArrow have binary wheels via pip inside the env; `pip` is the
+# source of truth in requirements.txt.
+
+name: sec-corpus
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11,<3.14
+  # OCR engine for RVL-CDIP email eligibility & edits (pytesseract wraps this binary).
+  - tesseract
+  - pip
+  - pip:
+      - -r requirements.txt

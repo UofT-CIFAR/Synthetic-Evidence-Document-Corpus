@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 try:
     import pytesseract
@@ -28,22 +27,37 @@ class OCRSummary:
     available: bool
 
 
-# Module-level cache so repeated confidence lookups across batches do not
-# re-shell out to Tesseract. Keyed by (path, mtime) so an image edited on disk
-# is re-OCR'd. A single Tesseract call on a SROIE receipt is 0.5–2 seconds, so
-# caching across 32 batches saves hours.
-_CONFIDENCE_CACHE: dict[tuple[str, int], "OCRSummary"] = {}
+# Module-level cache: keyed by (path, mtime). One ``image_to_data`` pass yields
+# OCRSummary plus word-token count for eligibility gates (EML RVL email pages).
+_DOCUMENT_OCR_CACHE: dict[tuple[str, int], tuple[OCRSummary, int]] = {}
 
 
 def mean_confidence(image_path: Path) -> OCRSummary:
+    summary, _wc = document_confidence_and_word_count(image_path)
+    return summary
+
+
+def document_confidence_and_word_count(
+    image_path: Path,
+    *,
+    min_word_conf: int = 35,
+) -> tuple[OCRSummary, int]:
+    """Mean OCR summary plus whitespace-split token count in one Tesseract pass.
+
+    Tokens included only when confidence ``>= min_word_conf`` (aligned with
+    ``primary_date_on_image`` token cutoff).
+    """
+
     if not _HAS_TESSERACT:
-        return OCRSummary(mean_confidence=0.0, line_count=0, available=False)
+        empty = OCRSummary(mean_confidence=0.0, line_count=0, available=False)
+        return empty, 0
     try:
         mtime = int(image_path.stat().st_mtime)
     except OSError:
-        return OCRSummary(mean_confidence=0.0, line_count=0, available=False)
+        empty = OCRSummary(mean_confidence=0.0, line_count=0, available=False)
+        return empty, 0
     key = (str(image_path), mtime)
-    cached = _CONFIDENCE_CACHE.get(key)
+    cached = _DOCUMENT_OCR_CACHE.get(key)
     if cached is not None:
         return cached
     try:
@@ -51,22 +65,41 @@ def mean_confidence(image_path: Path) -> OCRSummary:
             str(image_path), output_type=pytesseract.Output.DICT
         )
     except Exception:
-        result = OCRSummary(mean_confidence=0.0, line_count=0, available=False)
-        _CONFIDENCE_CACHE[key] = result
-        return result
+        pair = (OCRSummary(mean_confidence=0.0, line_count=0, available=False), 0)
+        _DOCUMENT_OCR_CACHE[key] = pair
+        return pair
     confidences = [float(c) for c in data.get("conf", []) if str(c).lstrip("-").isdigit()]
     confidences = [c for c in confidences if c >= 0]
     if not confidences:
-        result = OCRSummary(mean_confidence=0.0, line_count=0, available=True)
+        summary = OCRSummary(mean_confidence=0.0, line_count=0, available=True)
     else:
         mean = sum(confidences) / len(confidences) / 100.0
-        result = OCRSummary(
+        summary = OCRSummary(
             mean_confidence=mean,
             line_count=len([c for c in confidences if c > 0]),
             available=True,
         )
-    _CONFIDENCE_CACHE[key] = result
-    return result
+
+    texts_raw = data.get("text") or []
+    conf_raw = data.get("conf") or []
+    words: list[str] = []
+    for i, raw_t in enumerate(texts_raw):
+        try:
+            c_raw = conf_raw[i]
+            ci = int(c_raw) if str(c_raw).lstrip("-").isdigit() else -1
+        except (IndexError, TypeError, ValueError):
+            ci = -1
+        if ci < min_word_conf:
+            continue
+        t = str(raw_t or "").strip()
+        if t:
+            words.append(t)
+    blob = " ".join(words)
+    wc = len(blob.split()) if blob else 0
+
+    pair = (summary, wc)
+    _DOCUMENT_OCR_CACHE[key] = pair
+    return pair
 
 
 def detect_font(image_path: Path, region: tuple[int, int, int, int] | None = None) -> str | None:

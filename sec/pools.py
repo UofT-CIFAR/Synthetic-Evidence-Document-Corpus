@@ -13,6 +13,7 @@ import random
 from dataclasses import dataclass
 from typing import Iterable
 
+from .sources.mail_base import EmailItem
 from .sources.sroie import SROIEItem
 
 
@@ -47,6 +48,33 @@ def split_items(
         # Honor the dataset's own train/test marking as the primary signal,
         # then bucket the SROIE training split into our two pools so the
         # test pool always contains a held-back slice, as the spec requires.
+        if item.pool_hint == "test":
+            test_ids.append(item.doc_id)
+            continue
+        bucket = _bucket(item.doc_id)
+        if bucket < train_bucket_max_exclusive:
+            train_ids.append(item.doc_id)
+        else:
+            test_ids.append(item.doc_id)
+    return PoolSplit(
+        train_ids=tuple(sorted(train_ids)),
+        test_ids=tuple(sorted(test_ids)),
+    )
+
+
+def split_mail_items(
+    items: Iterable[EmailItem],
+    train_bucket_max_exclusive: int = 75,
+) -> PoolSplit:
+    """Train/test split for Enron-style ids (hashed bucket).
+
+    Items marked ``pool_hint == \"test\"`` (e.g. Avocado) always go to the test
+    id list so ``TST`` batches sample them; Enron uses bucket hashing only.
+    """
+
+    train_ids: list[str] = []
+    test_ids: list[str] = []
+    for item in items:
         if item.pool_hint == "test":
             test_ids.append(item.doc_id)
             continue

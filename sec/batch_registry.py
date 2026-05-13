@@ -73,9 +73,17 @@ _TRANSFORMATIONS = {
 
 
 def _sources(pool: str, family: str, tier: str) -> tuple[str, ...]:
+    if family == "EML":
+        if pool == "TRN":
+            if tier == "T4":
+                return ("Enron-anchors",)
+            return ("Enron", "RVL-CDIP-email")
+        if tier == "T4":
+            return ("Avocado-anchors",)
+        return ("Avocado",)
     if family != "RCT":
-        # Non-RCT families are out of scope for this deliverable but the
-        # registry still enumerates them for schema/seed validation.
+        # Non-RCT families besides EML are not implemented yet; the registry
+        # still enumerates cells for schema/seed validation.
         return ("<not-implemented>",)
     if pool == "TRN":
         if tier == "T3":
@@ -210,6 +218,65 @@ def findit2_batches() -> list[BatchSpec]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# RVL-CDIP email-class parallel track (EML family, training pool only).
+#
+# ``chainyo/rvl-cdip`` rows labeled ``email`` are cached as PNGs and run
+# through the same EML tiers as Enron. Batch IDs use a ``-RVLCDIP`` suffix and
+# seeds in the 17xxx band (disjoint from Enron EML 12xxx / FindIt 16xxx).
+# ---------------------------------------------------------------------------
+
+
+def rvl_cdip_eml_batch_seed(tier: str, variant: str) -> int:
+    if tier not in TIERS:
+        raise ValueError(tier)
+    if variant not in VARIANTS:
+        raise ValueError(variant)
+    base = 17000
+    return base + TIERS.index(tier) * 100 + VARIANTS.index(variant)
+
+
+def rvl_cdip_eml_batches() -> list[BatchSpec]:
+    """Training-only EML batches sourced from RVL-CDIP ``email`` pages."""
+
+    out: list[BatchSpec] = []
+    pool = "TRN"
+    items = _TRAIN_ITEMS
+    for tier in TIERS:
+        for variant in VARIANTS:
+            tf, tool = _tool_info(tier, variant)
+            batch_id = f"{pool}-EML-{tier}-{variant}-RVLCDIP"
+            out.append(
+                BatchSpec(
+                    batch_id=batch_id,
+                    pool=pool,
+                    family="EML",
+                    tier=tier,
+                    variant=variant,
+                    items=items,
+                    seed=rvl_cdip_eml_batch_seed(tier, variant),
+                    tool_family=tf,
+                    tool_specific=tool,
+                    source_datasets=("RVL-CDIP-email",),
+                    transformation=_TRANSFORMATIONS[("EML", tier)],
+                )
+            )
+    return out
+
+
+def eml_matrix_batches() -> list[BatchSpec]:
+    """32-cell matrix ``{TRN,TST}-EML-T{1..4}-{A..D}`` (Enron train / Avocado test)."""
+
+    return [b for b in all_batches() if b.family == "EML"]
+
+
+def eml_batches() -> list[BatchSpec]:
+    """Every EML batch id: matrix plus TRN-only ``*-RVLCDIP`` parallel track (16)."""
+
+    merged = [*eml_matrix_batches(), *rvl_cdip_eml_batches()]
+    return sorted(merged, key=lambda b: (b.pool, b.tier, b.variant, b.batch_id))
+
+
 def get(batch_id: str) -> BatchSpec:
     for b in all_batches():
         if b.batch_id == batch_id:
@@ -218,6 +285,9 @@ def get(batch_id: str) -> BatchSpec:
         if b.batch_id == batch_id:
             return b
     for b in findit2_batches():
+        if b.batch_id == batch_id:
+            return b
+    for b in rvl_cdip_eml_batches():
         if b.batch_id == batch_id:
             return b
     raise KeyError(f"Unknown batch_id: {batch_id}")
@@ -274,3 +344,15 @@ def validate_registry() -> None:
     fin_ids = {b.batch_id for b in fin}
     assert fin_ids.isdisjoint(ids), "FindIt2 batch IDs overlap SROIE batch IDs"
     assert fin_ids.isdisjoint(cord_ids), "FindIt2 batch IDs overlap CORD batch IDs"
+
+    rvl_eml = rvl_cdip_eml_batches()
+    assert len(rvl_eml) == 16, f"Expected 16 RVL-CDIP EML batches, got {len(rvl_eml)}"
+    rvl_seeds = {b.seed for b in rvl_eml}
+    assert len(rvl_seeds) == 16, "RVL-CDIP EML batch seeds must be unique"
+    assert rvl_seeds.isdisjoint(seeds), "RVL-CDIP EML seeds overlap base matrix seeds"
+    assert rvl_seeds.isdisjoint(cord_seeds), "RVL-CDIP EML seeds overlap CORD seeds"
+    assert rvl_seeds.isdisjoint(fin_seeds), "RVL-CDIP EML seeds overlap FindIt2 seeds"
+    rvl_ids = {b.batch_id for b in rvl_eml}
+    assert rvl_ids.isdisjoint(ids), "RVL-CDIP EML IDs overlap base batch IDs"
+    assert rvl_ids.isdisjoint(cord_ids), "RVL-CDIP EML IDs overlap CORD batch IDs"
+    assert rvl_ids.isdisjoint(fin_ids), "RVL-CDIP EML IDs overlap FindIt2 batch IDs"

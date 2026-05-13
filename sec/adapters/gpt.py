@@ -12,6 +12,16 @@ from PIL import Image
 
 from .base import AdapterCapabilityError, AdapterCredentialError, AdapterInfo
 
+
+def _is_openai_image_moderation_block(exc: BaseException) -> bool:
+    """Detect ``moderation_blocked`` / safety rejections from OpenAI ``images.*`` calls."""
+
+    if type(exc).__name__ != "BadRequestError":
+        return False
+    payload = str(exc).lower()
+    return "moderation_blocked" in payload or "safety_violations" in payload
+
+
 def _generate_size_for_aspect(w: int, h: int) -> str:
     """Pick a supported ``images.generate`` size closest to the desired aspect ratio."""
     if w <= 0 or h <= 0:
@@ -65,13 +75,20 @@ class GPTAdapter:
         img_bytes = _to_png_bytes(image)
         mask_bytes = _to_png_bytes(_normalize_mask(mask))
         # API rejects arbitrary WxH; ``auto`` lets the model pick, then we match source dims.
-        response = client.images.edit(
-            model=self._image_model,
-            image=("image.png", img_bytes, "image/png"),
-            mask=("mask.png", mask_bytes, "image/png"),
-            prompt=prompt,
-            size="auto",
-        )
+        try:
+            response = client.images.edit(
+                model=self._image_model,
+                image=("image.png", img_bytes, "image/png"),
+                mask=("mask.png", mask_bytes, "image/png"),
+                prompt=prompt,
+                size="auto",
+            )
+        except Exception as e:
+            if _is_openai_image_moderation_block(e):
+                raise AdapterCapabilityError(
+                    "OpenAI images.edit rejected by content moderation (input image and/or prompt)."
+                ) from e
+            raise
         out = _decode_response_image(response)
         if out.size != image.size:
             out = out.resize(image.size, Image.LANCZOS)
