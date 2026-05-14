@@ -13,6 +13,7 @@ import random
 from dataclasses import dataclass
 from typing import Iterable
 
+from .sources.doc_raster_base import DocRasterItem
 from .sources.mail_base import EmailItem
 from .sources.sroie import SROIEItem
 
@@ -56,6 +57,27 @@ def split_items(
             train_ids.append(item.doc_id)
         else:
             test_ids.append(item.doc_id)
+    return PoolSplit(
+        train_ids=tuple(sorted(train_ids)),
+        test_ids=tuple(sorted(test_ids)),
+    )
+
+
+def split_business_doc_items(items: Iterable[DocRasterItem]) -> PoolSplit:
+    """Train/test split for DOC business corpus (spec §3.1).
+
+    RVL non-email and DUDE items use ``pool_hint=\"train\"``. UCSF test-pool
+    items use ``pool_hint=\"test\"``. No hashed crossover — all training
+    sources stay in ``train_ids`` and UCSF in ``test_ids``.
+    """
+
+    train_ids: list[str] = []
+    test_ids: list[str] = []
+    for item in items:
+        if item.pool_hint == "test":
+            test_ids.append(item.doc_id)
+        else:
+            train_ids.append(item.doc_id)
     return PoolSplit(
         train_ids=tuple(sorted(train_ids)),
         test_ids=tuple(sorted(test_ids)),

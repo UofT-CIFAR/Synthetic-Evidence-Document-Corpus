@@ -123,18 +123,20 @@ def _build_clean_raster_controls(
         except Exception:
             counts.skipped += 1
             continue
+        item_src = getattr(item, "source_dataset", None) or src_dataset
+        item_lic = getattr(item, "source_license", None) or src_license
         round_trip = rng.random() < round_trip_fraction
         if round_trip:
             buf = io.BytesIO()
             image.save(buf, format="JPEG", quality=85)
             buf.seek(0)
             image = Image.open(buf).convert("RGB")
-        if family == "RCT" and src_dataset == "SROIE2019":
+        if family == "RCT" and item_src == "SROIE2019":
             uuid_key = f"sec:clean:{pool_upper}:{doc_id}"
         elif family == "RCT":
-            uuid_key = f"sec:clean:{src_dataset}:{pool_upper}:{doc_id}"
+            uuid_key = f"sec:clean:{item_src}:{pool_upper}:{doc_id}"
         else:
-            uuid_key = f"sec:clean:{family}:{src_dataset}:{pool_upper}:{doc_id}"
+            uuid_key = f"sec:clean:{family}:{item_src}:{pool_upper}:{doc_id}"
         artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, uuid_key))
         out_path = out_dir / f"{artifact_id}.png"
         marker = provenance.write_image_with_provenance(image, out_path, cfg=prov_cfg)
@@ -149,8 +151,8 @@ def _build_clean_raster_controls(
                 "tool_family": "none" if not round_trip else "image_editor",
                 "tool_specific": "none" if not round_trip else "PIL:JPEG q=85",
                 "source_artifact_id": doc_id,
-                "source_dataset": src_dataset,
-                "source_license": src_license,
+                "source_dataset": item_src,
+                "source_license": item_lic,
                 "prompt": None,
                 "edit_regions": None,
                 "identity_seed": None,

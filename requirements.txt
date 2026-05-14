@@ -8,7 +8,11 @@ pytesseract>=0.3.10
 opencv-python>=4.8
 requests>=2.31
 # CORD-v2 source track (`sec/sources/cord.py`) loads naver-clova-ix/cord-v2 via HF.
+# DOC family: DUDE tarball download via huggingface_hub; HF mirror still uses ``datasets``.
+huggingface_hub>=0.26.0
 datasets>=2.16
+# DOC family: DUDE / UCSF PDF rasterization (`sec/sources/pdf_page_png.py`).
+pdf2image>=1.17.0
 # Optional adapter dependencies: installed but only imported when the matching
 # variant is actually invoked. You can pin narrower versions in a deployment
 # lockfile.

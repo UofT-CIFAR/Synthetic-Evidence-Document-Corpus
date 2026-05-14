@@ -41,6 +41,27 @@ sources:
     root: /mnt/data/jaleh/CIFAR/Datasets/RVL-CDIP-email-cache
     hf_cache: /mnt/data/jaleh/CIFAR/Datasets/RVL-CDIP-email-cache/hf
     hf_name: chainyo/rvl-cdip
+  rvl_cdip_doc:
+    # HF mirror chainyo/rvl-cdip — all classes except email (``sec.sources.rvl_cdip_non_email``).
+    # Full export is ~15/16 of each loaded split (very large). Speed tips: set ``splits: [train]``
+    # to skip val/test; raise ``materialize_workers`` (e.g. 8) for parallel PNG writes; use
+    # ``max_items`` or env ``SEC_RVL_CDIP_DOC_MAX_ITEMS`` for pilots.
+    root: /mnt/data/jaleh/CIFAR/Datasets/RVL-CDIP-doc-cache
+    hf_cache: /mnt/data/jaleh/CIFAR/Datasets/RVL-CDIP-doc-cache/hf
+    hf_name: chainyo/rvl-cdip
+    splits: [train]
+    materialize_workers: 4
+  dude_amazon:
+    # DUDE ICDAR challenge PDFs — Amazon OCR / original format (``sec.sources.dude_amazon``).
+    root: /mnt/data/jaleh/CIFAR/Datasets/DUDE-doc-cache
+    hf_cache: /mnt/data/jaleh/CIFAR/Datasets/DUDE-doc-cache/hf
+    hf_config: Amazon_original
+    pdf_dpi: 200
+  ucsf_doc:
+    # UCSF Industry Documents — letter/memo/report PDFs for DOC test pool (spec §3.1).
+    root: /mnt/data/jaleh/CIFAR/UCSF/downloads
+    metadata_file: metadata.json
+    pdf_dpi: 200
 
 pool_split:
   # Disjoint by document ID: hash(doc_id) % 100 < 75 -> train else test.
